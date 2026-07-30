@@ -1,0 +1,33 @@
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# --- Runtime state ----------------------------------------------------------
+# Written by the GUI on close: contains the local IP and user labels.
+# Use kramer_gui_config.example.json as a starting point.
+kramer_gui_config.json
+
+# --- Internal notes, not for publication ------------------------------------
+handoff-*.md
+handoff/
+
+# --- Editors and tooling ----------------------------------------------------
+.claude/
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- OS ---------------------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store

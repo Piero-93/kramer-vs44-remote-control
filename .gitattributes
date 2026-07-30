@@ -1,0 +1,8 @@
+# Line endings: LF in the repository, native in the working tree.
+# Without this the result depends on each contributor's core.autocrlf setting,
+# which is how a repository ends up with mixed endings inside the same file.
+* text=auto
+
+*.py   text diff=python
+*.md   text
+*.json text

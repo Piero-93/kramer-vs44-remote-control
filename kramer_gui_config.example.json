@@ -1,0 +1,27 @@
+{
+  "host": "192.168.1.39",
+  "port": 5000,
+  "proto": "auto",
+  "inputs": [
+    "IN 1",
+    "IN 2",
+    "IN 3",
+    "IN 4"
+  ],
+  "outputs": [
+    "OUT 1",
+    "OUT 2",
+    "OUT 3",
+    "OUT 4"
+  ],
+  "presets": [
+    "Preset 1",
+    "Preset 2",
+    "Preset 3",
+    "Preset 4",
+    "Preset 5",
+    "Preset 6",
+    "Preset 7",
+    "Preset 8"
+  ]
+}

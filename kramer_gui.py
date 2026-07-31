@@ -83,12 +83,25 @@ FOCUS_REFRESH_MIN_GAP = 1.5
 P2000_SWITCH_VIDEO = 1
 
 
+# Set by load_config() when the settings file was there but unusable, and shown
+# in the log panel once it exists. A print would go nowhere in a windowed build -
+# stdout is redirected to devnull precisely so argparse cannot crash - and losing
+# your labels without being told is the failure this project keeps designing
+# against.
+CONFIG_PROBLEM = None
+
+
 def load_config():
+    global CONFIG_PROBLEM
+    CONFIG_PROBLEM = None
+
+    def unreadable(e):
+        global CONFIG_PROBLEM
+        CONFIG_PROBLEM = f"{CONFIG_PATH} could not be read ({e}); using defaults"
+        print(CONFIG_PROBLEM)
+
     cfg = dict(DEFAULT_CONFIG)
-    cfg.update(kp.read_json(
-        CONFIG_PATH,
-        on_error=lambda e: print(f"Unreadable config, falling back to "
-                                 f"defaults: {e}")))
+    cfg.update(kp.read_json(CONFIG_PATH, on_error=unreadable))
     # normalise the lengths: a hand-edited file must not break the UI
     for key, n in (("inputs", 4), ("outputs", 4), ("presets", 8)):
         vals = list(cfg.get(key) or [])[:n]
@@ -419,6 +432,8 @@ class App:
         # user profile is what tells you that a settings file placed next to the
         # program would be used instead.
         self._write_log(f"settings file: {CONFIG_PATH}")
+        if CONFIG_PROBLEM:
+            self._write_log(f"!! {CONFIG_PROBLEM}")
         root.after(80, self._drain)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 

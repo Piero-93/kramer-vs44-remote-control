@@ -467,6 +467,15 @@ cfg = g.load_config()
 check("an out-of-range interval falls back", cfg["autorefresh_interval"],
       g.DEFAULT_CONFIG["autorefresh_interval"])
 check("a truthy string is coerced to bool", cfg["autorefresh"], True)
+check("a readable file reports no problem", g.CONFIG_PROBLEM, None)
+
+# An unusable settings file must be *said*, not printed into a console that a
+# windowed build does not have. The window shows it once the log panel exists.
+g.CONFIG_PATH.write_text("{ not json at all", encoding="utf-8")
+g.load_config()
+check("an unreadable settings file is recorded", g.CONFIG_PROBLEM is not None,
+      True)
+check("and names the file", str(g.CONFIG_PATH) in g.CONFIG_PROBLEM, True)
 
 
 failed = [line for ok, line in results if not ok]

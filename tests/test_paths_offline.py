@@ -180,6 +180,19 @@ not_an_object = temp_dir() / "list.json"
 not_an_object.write_text("[1, 2, 3]", encoding="utf-8")
 check("a JSON array is not a settings file", kp.read_json(not_an_object), {})
 
+# A Windows editor - Notepad, or PowerShell's Set-Content -Encoding UTF8 - writes
+# a byte-order mark, and json.loads refuses it. Anyone hand-editing the settings
+# on Windows would otherwise silently get the defaults back, and in a windowed
+# build there is no console for the complaint to appear in.
+bom = temp_dir() / "bom.json"
+bom.write_bytes(b"\xef\xbb\xbf" + b'{"host": "10.9.8.7"}')
+check("a byte-order mark does not hide the settings",
+      kp.read_json(bom).get("host"), "10.9.8.7")
+plain = temp_dir() / "plain.json"
+plain.write_bytes(b'{"host": "10.9.8.7"}')
+check("and a file without one still reads", kp.read_json(plain).get("host"),
+      "10.9.8.7")
+
 
 # --- writing --------------------------------------------------------------- #
 target = temp_dir() / "missing" / "sub" / kp.CONFIG_NAME

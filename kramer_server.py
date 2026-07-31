@@ -137,14 +137,14 @@ class DeviceLink:
     """
 
     IDLE_POLL = 0.2                 # seconds spent listening between jobs
-    RECONNECT_DELAY = 3.0           # pause before retrying a failed connection
-    HEARTBEAT = 30.0                # seconds of silence before probing the link
+    RECONNECT_DELAY = kv.RECONNECT_DELAY
+    HEARTBEAT = kv.HEARTBEAT
 
     def __init__(self, host, port, machine=1, on_change=None, heartbeat=None):
         self.host, self.port, self.machine = host, port, machine
-        self.heartbeat = self.HEARTBEAT if heartbeat is None else heartbeat
-        self._last_ok = 0.0         # last time the matrix demonstrably answered
-        self._logged_error = None   # so a retry loop does not repeat itself
+        # When to probe and whether it answered lives in kramer_vs44, shared with
+        # the GUI: it is the same decision, and two copies of it would drift.
+        self.monitor = kv.LinkMonitor(heartbeat)
         self.on_change = on_change or (lambda: None)
         self.routing = {}           # {output: input}, 0 means disconnected
         self.presets = {}           # {slot: bool}, True when the slot holds a layout
@@ -218,8 +218,10 @@ class DeviceLink:
                 self._maybe_beat()
                 continue
             try:
+                # No mark_ok here on purpose: whether the device answered is
+                # recorded by the transport as bytes arrive. A job that returned
+                # without a reply is not evidence of anything.
                 box.put((True, fn(self._proto)))
-                self._last_ok = time.monotonic()
             except OSError as e:
                 # A socket-level failure means the link is gone, not that the
                 # command was wrong: report it and start reconnecting.
@@ -247,8 +249,7 @@ class DeviceLink:
             self.presets = self._read_presets(proto)
             self.connected = True
             self.error = None
-            self._last_ok = time.monotonic()
-            self._logged_error = None
+            self.monitor.mark_ok()
             log(f"connected to {self.detail} ({proto.name}), routing {self.routing}, "
                 f"presets defined {sorted(n for n, v in self.presets.items() if v)}")
             self.on_change()
@@ -258,10 +259,9 @@ class DeviceLink:
             # Retries are fast on purpose, so the same failure would otherwise
             # fill the log with thousands of identical lines overnight. Say it
             # once; the reconnection is logged when it happens.
-            if self.error != self._logged_error:
+            if self.monitor.first_time(self.error):
                 log(f"connection to {self.detail} failed: {self.error} "
                     f"(retrying every {self.RECONNECT_DELAY:g}s, silently)")
-                self._logged_error = self.error
             self.on_change()
             self._stop.wait(self.RECONNECT_DELAY)
 
@@ -272,8 +272,9 @@ class DeviceLink:
 
     def _listen(self):
         try:
-            if self._proto.poll_notifications(self.IDLE_POLL):
-                self._last_ok = time.monotonic()
+            # Anything that arrives updates the transport's own last_rx, so the
+            # liveness timer needs no bookkeeping here.
+            self._proto.poll_notifications(self.IDLE_POLL)
         except OSError as e:
             # Includes the ConnectionError raised when the matrix closes the
             # socket, which is the only drop that can be noticed passively.
@@ -288,21 +289,17 @@ class DeviceLink:
         nothing to say. Silence is therefore not evidence of anything, and has to
         be probed.
 
-        Note that no reply is a failure just as much as an error is: the send
-        succeeds into the void and _cmd() returns an empty list without raising.
-        A liveness check that only watches for exceptions would never fire."""
-        if not self.heartbeat:
-            return
-        if time.monotonic() - self._last_ok < self.heartbeat:
+        The decision and its two traps live in kramer_vs44.LinkMonitor, shared
+        with the GUI."""
+        if not self.monitor.due(self._transport):
             return
         try:
-            if self._proto.ping():
-                self._last_ok = time.monotonic()
-                return
+            reason = self.monitor.beat(self._proto)
         except OSError as e:
             self._drop(e)
             return
-        self._drop("no reply to the liveness check")
+        if reason:
+            self._drop(reason)
 
     def _notified(self, frames):
         """Called on this thread by Protocol2000 for frames the matrix sent by

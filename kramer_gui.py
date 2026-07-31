@@ -169,68 +169,183 @@ class LoggingSerial(_LogMixin, kv.SerialTransport):
 # --------------------------------------------------------------------------- #
 
 class Worker(threading.Thread):
-    """Runs the jobs in sequence, and listens passively while idle.
+    """Owns the link to the matrix: opens it, runs jobs on it, listens on it,
+    probes it when it goes quiet, and reopens it when it dies.
 
     The protocol's 200 ms rate limit is guaranteed by the Transport, which makes
     a single thread a requirement rather than a preference: two concurrent
-    threads would violate the timing. The passive listener therefore lives in
-    this same loop instead of in a thread of its own."""
+    threads would violate the timing. Everything therefore happens in this one
+    loop - the passive listener, the liveness probe and the reconnection - and
+    the loop never blocks for longer than IDLE_POLL, so stopping stays prompt
+    even in the middle of a retry.
+
+    Results are posted as (tag, payload, error) for the Tk thread to drain. The
+    link-related tags are link_up, link_down and link_retry; `connect` is kept
+    for a first attempt that failed, because that is the one the user is waiting
+    on and the only one that deserves a dialog."""
 
     IDLE_POLL = 0.2                     # seconds spent listening between jobs
+    RECONNECT_DELAY = kv.RECONNECT_DELAY
 
-    def __init__(self, results):
+    def __init__(self, results, heartbeat=None):
         super().__init__(daemon=True)
         self.jobs = queue.Queue()
         self.results = results
         self.transport = None
         self.proto = None
-        self._listen_broken = False
+        self.monitor = kv.LinkMonitor(heartbeat)
+        self.connector = None           # callable() -> (transport, proto, detail)
+        self.on_notify = None
+        self.want_link = False          # the user asked for a link and has not cancelled
+        self._next_try = 0.0
+        self._down_since = 0.0
+        self._listen_bug = False
+        self._stop = threading.Event()
 
-    def attach(self, transport, proto, on_notify):
-        """Called by the connect job once the link is up."""
-        self.transport = transport
-        self.proto = proto
-        proto.on_notify = on_notify
-        self._listen_broken = False
+    # ----- what the UI calls ---------------------------------------------- #
 
-    def detach(self):
-        self.transport = None
-        self.proto = None
-        self._listen_broken = False
+    def link(self, connector, on_notify):
+        """Ask for a link, and keep asking until unlink() or a first failure.
 
-    def submit(self, tag, fn):
-        self.jobs.put((tag, fn))
+        connector is called on this thread and must return
+        (transport, proto, detail). It is a closure built when Connect was
+        pressed, so a reconnection cannot silently retarget a different address
+        because someone was editing the field in the meantime."""
+        self.connector = connector
+        self.on_notify = on_notify
+        self.want_link = True
+        self._down_since = 0.0
+        self._next_try = 0.0
+
+    def unlink(self):
+        self.want_link = False
+        self._close()
+        self.results.put(("link_down", {"reason": "disconnected",
+                                        "retrying": False}, None))
+
+    def submit(self, tag, fn, needs_link=True):
+        self.jobs.put((tag, fn, needs_link))
 
     def stop(self):
+        self._stop.set()
         self.jobs.put(None)
 
+    # ----- the loop -------------------------------------------------------- #
+
     def run(self):
-        while True:
+        while not self._stop.is_set():
+            if self.want_link and not self.proto \
+                    and time.monotonic() >= self._next_try:
+                self._connect()
             try:
                 item = self.jobs.get(timeout=self.IDLE_POLL)
             except queue.Empty:
-                self._listen()
+                if self.proto:
+                    self._listen()
+                    self._maybe_beat()
                 continue
             if item is None:
                 break
-            tag, fn = item
+            tag, fn, needs_link = item
+            if needs_link and not self.proto:
+                # Fail fast rather than calling fn with no protocol object. The
+                # UI already says the link is down; this keeps a queued click
+                # from turning into an AttributeError.
+                self.results.put((tag, None,
+                                  ConnectionError("the link is down")))
+                continue
             try:
                 self.results.put((tag, fn(self), None))
-            except Exception as e:
+            except OSError as e:
+                # Socket-level: the link is gone, not the command wrong.
                 self.results.put((tag, None, e))
+                self._drop(e)
+            except Exception as e:
+                # A bad command must not take the link down with it.
+                self.results.put((tag, None, e))
+
+    def _connect(self):
+        try:
+            transport, proto, detail = self.connector()
+            proto.on_notify = self.on_notify
+            self.transport, self.proto = transport, proto
+            self.monitor.mark_ok()
+            self._listen_bug = False
+            relink = bool(self._down_since)
+            elapsed = int(time.monotonic() - self._down_since) if relink else 0
+            self._down_since = 0.0
+            self.results.put(("link_up", {"detail": detail, "relink": relink,
+                                          "elapsed": elapsed}, None))
+        except (OSError, ConnectionError) as e:
+            self._close()
+            if not self._down_since:
+                # The very first attempt: the user is waiting on it, so report it
+                # as the failure of what they asked for and stop. Retrying behind
+                # a mistyped address would be a loop nobody asked for.
+                self.want_link = False
+                self.results.put(("connect", None, e))
+                return
+            self._next_try = time.monotonic() + self.RECONNECT_DELAY
+            if self.monitor.first_time(str(e)):
+                self.results.put(("link_retry", {"error": str(e)}, None))
+        except Exception as e:
+            # Anything that is not a connection problem is a bug, and retrying a
+            # bug every few seconds helps nobody.
+            self._close()
+            self.want_link = False
+            self.results.put(("connect", None, e))
 
     def _listen(self):
         """Read what the device transmits by itself. A VS-44HN sends a SWITCH
         VIDEO frame when a front-panel button is pressed, which is what keeps
         the grid in sync without polling."""
-        if self._listen_broken or not (self.transport and self.proto):
-            return
         try:
             self.proto.poll_notifications(self.IDLE_POLL)
+        except OSError as e:
+            self._drop(e)
         except Exception as e:
-            # Reported once: repeating it every 200 ms would bury the log.
-            self._listen_broken = True
-            self.results.put(("listen", None, e))
+            # Not a link failure - a decoding bug, say. Reconnecting cannot fix
+            # it, and letting it escape would kill this thread and leave the
+            # window silently inert. Report it once and stop listening.
+            if not self._listen_bug:
+                self._listen_bug = True
+                self.results.put(("listen", None, e))
+
+    def _maybe_beat(self):
+        """Probe a link that has gone quiet. The decision lives in
+        kramer_vs44.LinkMonitor, shared with the service."""
+        if not self.monitor.due(self.transport):
+            return
+        # Held in a local: _drop() clears self.transport, and the finally below
+        # still has to unmute the object it muted.
+        transport = self.transport
+        transport.set_muted(True)           # a probe every 30 s is not worth logging
+        try:
+            reason = self.monitor.beat(self.proto)
+        except OSError as e:
+            self._drop(e)
+            return
+        finally:
+            transport.set_muted(False)
+        if reason:
+            self._drop(reason)
+
+    def _drop(self, error):
+        self._close()
+        self._down_since = time.monotonic()
+        self._next_try = self._down_since + self.RECONNECT_DELAY
+        self.monitor.first_time(str(error))     # so the first retry stays quiet
+        self.results.put(("link_down", {"reason": str(error),
+                                        "retrying": self.want_link}, None))
+
+    def _close(self):
+        if self.transport:
+            try:
+                self.transport.close()
+            except Exception:
+                pass
+        self.transport = None
+        self.proto = None
 
 
 # --------------------------------------------------------------------------- #
@@ -273,9 +388,16 @@ class App:
         self.cli = cli_args
         self.results = queue.Queue()
         self.log_queue = queue.Queue()
-        self.worker = Worker(self.results)
+        self.worker = Worker(self.results, heartbeat=cli_args.heartbeat)
         self.worker.start()
         self.connected = False
+        # "idle" | "connecting" | "up" | "reconnecting". connected stays as the
+        # plain boolean meaning link_state == "up", because every action guards
+        # on it and the tests assign it.
+        self.link_state = "idle"
+        self.link_detail = ""
+        self._down_since = 0.0
+        self._shown_down_secs = -1
         self._autorefresh_job = None
         self._had_focus = False
         self._last_auto = 0.0
@@ -500,33 +622,52 @@ class App:
         if focus and not self._had_focus:
             self._on_focus_gained()
         self._had_focus = focus
+        # The reconnecting counter ticks from here rather than from a timer of
+        # its own; redrawing only when the whole second changes keeps it cheap.
+        if self.link_state == "reconnecting":
+            secs = int(time.monotonic() - self._down_since)
+            if secs != self._shown_down_secs:
+                self._shown_down_secs = secs
+                self._render_link()
         self.root.after(80, self._drain)
 
     def _handle(self, tag, res, err):
         if tag == "status_auto":
             self._auto_pending = False
         if err:
+            if tag == "status_auto" and isinstance(err, ConnectionError):
+                # The link is already known to be down and the indicator says so;
+                # a log line per automatic read would just repeat it.
+                return
             self._write_log(f"!! {tag}: {err}")
             if tag == "connect":
+                # Only a first attempt reaches here, and the user is waiting on
+                # it. Reconnections never raise a dialog: one every few seconds
+                # for a minute and a half would be unusable.
                 self._mark_disconnected()
                 messagebox.showerror("Connection failed", str(err))
-            elif tag == "status_auto":
-                # One failure is enough: the link is broken, and retrying every
-                # few seconds would only fill the log with the same error.
-                self.autorefresh.set(False)
-                self._schedule_autorefresh()
-                self._write_log("   auto-refresh turned off after the error above")
             return
-        if tag == "connect":
+        if tag == "link_up":
             self.connected = True
-            self.status.configure(text=f"● {res}", foreground="#2a7")
+            self.link_state = "up"
+            self.link_detail = res["detail"]
             self.connect_btn.configure(text="Disconnect")
             self._set_enabled(True)
-            self._write_log(f"== connected, {res}")
+            self._render_link()
+            if res["relink"]:
+                self._write_log(f"== reconnected after {res['elapsed']}s, "
+                                f"{res['detail']}")
+            else:
+                self._write_log(f"== connected, {res['detail']}")
             self._refresh()
             self._schedule_autorefresh()
-        elif tag == "disconnect":
-            self._mark_disconnected()
+        elif tag == "link_down":
+            if res["retrying"]:
+                self._mark_link_lost(res["reason"])
+            else:
+                self._mark_disconnected()
+        elif tag == "link_retry":
+            self._write_log(f"   still trying: {res['error']}")
         elif tag == "status":
             self._apply_status(res)
         elif tag == "status_auto":
@@ -542,13 +683,59 @@ class App:
 
     def _mark_disconnected(self):
         self.connected = False
-        self.status.configure(text="● not connected", foreground="#a33")
+        self.link_state = "idle"
+        self.link_detail = ""
+        self._down_since = 0.0
         self.connect_btn.configure(text="Connect")
         self._set_enabled(False)
         self._auto_pending = False
         self._schedule_autorefresh()            # cancels the pending tick
+        self._blank_grid()
+        self._render_link()
+
+    def _mark_link_lost(self, reason):
+        """The link went away by itself and the worker is trying to get it back.
+
+        The button stays on Disconnect, because stopping the retries has to
+        remain possible, and no dialog appears: one every few seconds for the
+        minute and a half this device can take to come back would be unusable."""
+        self.connected = False
+        self.link_state = "reconnecting"
+        self._down_since = time.monotonic()
+        self._auto_pending = False
+        self._set_enabled(False)
+        self._schedule_autorefresh()
+        self._blank_grid()
+        self._render_link()
+        self._write_log(f"!! link lost: {reason} - reconnecting")
+
+    def _blank_grid(self):
+        """Stop showing routing that cannot be vouched for.
+
+        A greyed-out radio button still reads as *set*, and the front panel can
+        move things while the link is down. Silent staleness is the worst failure
+        a control panel can have, so the marks go away entirely; reconnecting
+        re-reads the state and fills them back in within about a second."""
         for v in self.route_vars.values():
             v.set(-1)
+
+    def _render_link(self):
+        """The connection indicator, redrawn from link_state.
+
+        While reconnecting it counts the seconds, and that is not decoration:
+        this matrix has been measured taking about 90 seconds to accept a new
+        connection, and a static amber dot for a minute and a half is
+        indistinguishable from a hung program."""
+        if self.link_state == "up":
+            self.status.configure(text=f"● {self.link_detail}", foreground="#2a7")
+        elif self.link_state == "connecting":
+            self.status.configure(text="● connecting…", foreground="#a70")
+        elif self.link_state == "reconnecting":
+            secs = int(time.monotonic() - self._down_since)
+            self.status.configure(text=f"● link lost, reconnecting… ({secs}s)",
+                                  foreground="#a70")
+        else:
+            self.status.configure(text="● not connected", foreground="#a33")
 
     def _apply_status(self, mapping, quiet=False):
         """quiet=True is the automatic refresh: only differences are logged, so
@@ -637,13 +824,10 @@ class App:
     # ----- actions -------------------------------------------------------- #
 
     def _toggle_connect(self):
-        if self.connected:
-            def job(w):
-                if w.transport:
-                    w.transport.close()
-                w.detach()
-                return "closed"
-            self.worker.submit("disconnect", job)
+        if self.link_state != "idle":
+            # Covers "up" and "reconnecting": the button reads Disconnect in both,
+            # and stopping a retry loop has to be possible.
+            self.worker.unlink()
             return
 
         mode = self.mode.get()
@@ -655,7 +839,12 @@ class App:
             messagebox.showerror("Invalid port", "The port must be a number.")
             return
 
-        def job(w):
+        def connector():
+            """Opens the link. Runs on the worker thread, and is called again for
+            every reconnection - which is why the settings are captured here,
+            when Connect was pressed, rather than read from the widgets. A
+            reconnection must not quietly retarget a different address because
+            someone was mid-edit in the IP field."""
             if mode == "tcp":
                 t = LoggingTcp(host, port)
             else:
@@ -663,23 +852,28 @@ class App:
             t.attach_log(self._logline)
             if proto_choice == "p2000":
                 proto = kv.Protocol2000(t)
+                if not proto.ping():
+                    t.close()
+                    raise ConnectionError("connected, but the matrix did not "
+                                          "answer Protocol 2000")
             elif proto_choice == "p3000":
                 proto = kv.Protocol3000(t)
             else:
+                # Detection already proves the link, so no second identify.
                 proto, _ = kv.detect_protocol(t)
                 if proto is None:
                     t.close()
-                    raise RuntimeError(
+                    raise ConnectionError(
                         "No valid reply. Check the IP/port (5000, 10001 or 50000) "
                         "and that the device is powered on.")
-            # The callback runs on the worker thread, so it only queues a result:
-            # touching Tk from here would be a crash waiting to happen.
-            w.attach(t, proto,
-                     lambda frames: self.results.put(("notify", frames, None)))
-            return f"{t} — {proto.name}"
+            return t, proto, f"{t} — {proto.name}"
 
-        self.status.configure(text="● connecting…", foreground="#a70")
-        self.worker.submit("connect", job)
+        self.link_state = "connecting"
+        self._render_link()
+        # The notification callback runs on the worker thread, so it only queues
+        # a result: touching Tk from there would be a crash waiting to happen.
+        self.worker.link(connector,
+                         lambda frames: self.results.put(("notify", frames, None)))
 
     def _switch(self, inp, out):
         if not self.connected:
@@ -806,8 +1000,9 @@ class App:
                 "Settings not saved",
                 f"Your labels and preset names could not be written to\n"
                 f"{CONFIG_PATH}\n\n{failure}")
-        if self.connected:
-            self.worker.submit("disconnect", lambda w: (w.transport.close(), "closed")[1])
+        # Unconditional: a link that is merely being retried still has to stop
+        # being retried, and unlink() copes with there being no transport.
+        self.worker.unlink()
         self.worker.stop()
         self.root.destroy()
 
@@ -826,6 +1021,12 @@ def main():
     ap.add_argument("--host", help="matrix IP address (default 192.168.1.39)")
     ap.add_argument("--port", type=int, help="TCP port (5000, 10001 or 50000)")
     ap.add_argument("--serial", help="use the serial port, e.g. COM3")
+    ap.add_argument("--heartbeat", type=float, default=kv.HEARTBEAT,
+                    metavar="SECONDS",
+                    help=f"probe the matrix after this much silence (default "
+                         f"{kv.HEARTBEAT:g}; 0 disables the check, and a matrix "
+                         f"switched off silently will then keep being reported "
+                         f"as connected)")
     kp.add_common_arguments(ap)
     args = ap.parse_args()
     CONFIG_PATH = kp.config_path(args.config)

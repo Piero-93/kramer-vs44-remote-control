@@ -7,8 +7,8 @@ fixed order, and forcing that into per-test isolation would cost more than it cu
 | Script | Needs hardware | What it covers |
 |---|---|---|
 | `test_paths_offline.py` | no | Where the settings file is resolved from, both platform branches, the frozen-executable case, and that a write either lands completely or leaves the previous file untouched |
-| `test_protocol_offline.py` | no | Frame generation against the byte sequences confirmed in the manual and on hardware, reply decoding, the `expect` shortcut, end-of-stream handling, and the separation of unsolicited frames from replies — driven through a fake socket |
-| `test_gui_offline.py` | no | Window construction, the passive-listener wiring, periodic-refresh scheduling and its guards, notification handling, config round-trip and sanitisation |
+| `test_protocol_offline.py` | no | Frame generation against the byte sequences confirmed in the manual and on hardware, reply decoding, the `expect` shortcut, end-of-stream handling, the separation of unsolicited frames from replies, and the shared liveness policy — driven through a fake socket |
+| `test_gui_offline.py` | no | Window construction, the worker owning the link, the liveness probe and the reconnect loop, periodic-refresh scheduling and its guards, notification handling, what the window shows while the link is down, config round-trip and sanitisation |
 | `test_server_offline.py` | no | Every HTTP route, request validation, the label round-trip and its read-modify-write, the token gate, the `--allow-preset-store` gate and the preset occupancy map, the event stream, and that a stalled browser cannot block the device thread |
 | `test_gui_live.py` | yes | The GUI worker against a live socket, the listener running in the idle gaps without stealing command replies, log muting, connect/disconnect |
 | `test_server_live.py` | yes | The service's device thread against a live socket, events end to end, and recovery after the link drops |
@@ -55,6 +55,12 @@ seconds.
 `test_server_live.py` also closes the socket under the device thread on purpose, to check that the
 link is noticed as dead and re-established. Expect a few seconds during which the service reports
 itself disconnected — that is the test working, not a fault.
+
+`test_gui_live.py --drop-link` does the same to the window: the socket is closed underneath it, and
+the check is that the indicator turns amber, the grid stops claiming a routing, and it repairs
+itself with nobody clicking anything. Give it time — a *cleanly* closed socket comes back in about
+three seconds, but a matrix that lost its connection ungracefully has been measured refusing a new
+one for roughly ninety.
 
 Run the live tests **one at a time and with no other controller running**, for the same reason the
 main README gives: the matrix does not report one client's switches to another.

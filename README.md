@@ -324,12 +324,39 @@ across a socket drop. The periodic read reconciles, and is deliberately restrain
   into a burst;
 - a new read is **never queued while the previous one is still running**;
 - the byte log is **muted** during automatic reads and only **differences** are reported, so the
-  log stays a record of real events instead of a wall of identical state dumps;
-- on the first error it **switches itself off** with a log line, rather than repeating the same
-  failure every few seconds.
+  log stays a record of real events instead of a wall of identical state dumps.
 
 Interval choices are 5, 10, 30 and 60 seconds, default 30 — slow on purpose, since the listener is
-what provides immediacy. Both the checkbox and the interval are persisted.
+what provides immediacy. Both the checkbox and the interval are persisted, and nothing here ever
+switches your setting off behind your back: a failure is the link's problem, and the link says so
+itself.
+
+### Noticing that the matrix is gone, and getting it back
+
+The GUI probes and reconnects on exactly the same terms as the service — the decision of *when to
+probe and what counts as an answer* is one piece of code both of them use, because it is subtle
+enough that two copies would eventually disagree. See
+[Noticing that the matrix is gone](#noticing-that-the-matrix-is-gone) for the measurements behind
+it, all of which apply here too.
+
+What that looks like in the window:
+
+- the indicator turns amber and reads `link lost, reconnecting… (47s)`. **The seconds are not
+  decoration**: this matrix has been measured taking around 90 seconds to accept a new connection
+  after losing one, and a motionless amber dot for a minute and a half is indistinguishable from a
+  hung program;
+- the routing grid **goes blank**. A greyed-out radio button still reads as *set*, and the front
+  panel can move things while the link is down, so showing nothing is the honest answer. It fills
+  back in about a second after the link returns, and anything that moved meanwhile appears in the
+  log as `changed on the device: {…}`;
+- the button stays on **Disconnect**, because stopping the retries has to remain possible;
+- **no dialog box.** One every few seconds for the length of an outage would be unusable. A dialog
+  appears only when the *first* connection attempt fails — that one you are waiting on, and it does
+  not start a retry loop behind a mistyped address.
+
+`--heartbeat SECONDS` changes how much silence is tolerated before probing, default 30. `0` disables
+it, and then a matrix switched off silently will keep being reported as connected — which is the
+whole thing this exists to prevent.
 
 `#FACTORY` is deliberately **not** exposed as a button — see [Design notes](#design-notes).
 
@@ -776,12 +803,12 @@ Maximum 64 characters per string. Commands can be concatenated with `|`.
 | `DISCOVER_PORTS` | `(5000, 10001, 50000)` | |
 | `BAUD` | `9600` | same for both protocols |
 | `P2000_TO_P3000` | `38 80 83 81` | instruction 56 |
+| `HEARTBEAT` | `30.0` | silence tolerated before probing a link, shared by both programs |
+| `RECONNECT_DELAY` | `3.0` | pause before retrying a failed connection, shared |
 | `AUTOREFRESH_INTERVALS` | `(5, 10, 30, 60)` | GUI, seconds |
 | `FOCUS_REFRESH_MIN_GAP` | `1.5` | GUI, throttles refresh-on-focus |
 | `Worker.IDLE_POLL` | `0.2` | GUI, seconds spent listening between jobs |
 | `DeviceLink.IDLE_POLL` | `0.2` | service, seconds spent listening between jobs |
-| `DeviceLink.RECONNECT_DELAY` | `3.0` | service, pause before retrying a failed connection |
-| `DeviceLink.HEARTBEAT` | `30.0` | service, silence tolerated before probing the link |
 | `SSE_KEEPALIVE` | `15.0` | service, seconds between event-stream keepalives |
 | `SSE_BACKLOG` | `32` | service, events buffered per browser before dropping |
 
@@ -823,9 +850,17 @@ These are deliberate choices, not accidents.
 2. **All I/O runs on a single worker thread.** This is not a style preference: the 200 ms rate
    limit is enforced by the `Transport` object, so two concurrent threads would violate the
    protocol timing. Any extension must go through the existing job queue — including the passive
-   listener, which runs in the idle gaps of that same loop rather than in a thread of its own.
-   The notification callback fires on the worker thread and therefore only queues a result; it
-   never touches Tk.
+   listener, the liveness probe and the reconnection, which all run in the idle gaps of that same
+   loop rather than in threads of their own. The notification callback fires on the worker thread
+   and therefore only queues a result; it never touches Tk.
+10. **The two programs share the liveness *policy*, not the loop.** `kramer_vs44.LinkMonitor`
+   answers "has this been quiet too long" and "did the probe get an answer", and both the GUI and
+   the service use it, because those two questions contain the subtlety and two copies would drift
+   apart on exactly that. The loops around it stay separate and are genuinely different shapes:
+   fire-and-forget with a Tk-drained result queue on one side, a synchronous `call(fn, timeout)` on
+   the other. Liveness is anchored on `Transport.last_rx` — bytes actually received — rather than on
+   commands that returned, because a read of a dead-but-open link "succeeds" with every value
+   `None`, and a program that refreshes as often as it probes would then never probe at all.
 3. **`#FACTORY` is not exposed in the GUI.** It is the only command that destroys presets and
    EDID, and it must not sit one click away from `#RESET`. It remains reachable, knowingly,
    through the raw-command field.
@@ -862,21 +897,16 @@ These are deliberate choices, not accidents.
 - **Two controllers cannot both stay in sync, and neither is told so.** The device announces a
   front-panel press to one connected client only, and never announces a command issued by another
   client. Whichever controller loses shows stale routing with no error — hence one at a time.
-- **The Tkinter GUI does not reconnect, and does not probe the link.** If the matrix closes its
-  socket the next read now fails, so auto-refresh turns itself off and says so — but if the matrix
-  dies *silently*, which is what pulling the cable produces, the GUI notices nothing until you ask
-  it to do something, and the indicator stays green. Only the web service probes for this.
 - **The web service has no authentication unless you set `--token`,** and no TLS in any case.
-- **The protocol layer has no unit tests yet.** The GUI and the state tracking are covered by
-  `tests/`; frame generation and the parsing helpers are currently only exercised through
-  `--dry-run` and against hardware.
+- **Serial reconnection is untested.** The GUI retries a vanished serial port the same way it
+  retries a socket, because `SerialTransport` raises on open like anything else — but with no
+  adapter here it has never actually been run.
 - **EDID commands are not implemented** (deliberately — see above).
 
 ## Roadmap
 
 - **OS-level hotkeys** binding preset recall to a key combination — the original motivation for
   the project. A resident helper may be needed if Python's startup time is noticeable.
-- **Reconnection in the Tkinter GUI**, which the web service already does.
 - **Protocol unit tests**: `parse_raw`, `parse_vid_reply`, `hexdump`, and Protocol 2000 frame
   generation compared against the verified byte sequences above. The GUI and the service already
   have coverage in [`tests/`](tests/).

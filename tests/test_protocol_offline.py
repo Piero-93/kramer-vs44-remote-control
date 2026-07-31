@@ -12,6 +12,7 @@ notices the matrix going away.
 
 import socket
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -164,6 +165,85 @@ check("and it is flagged as coming from the device", seen[0][0]["from_device"],
 t = transport_with([None])
 proto = kv.Protocol2000(t)
 check("no reply gives an empty list", proto._cmd(5, inp=0, out=1), [])
+
+# --- the transport records when the device last said something ------------- #
+t = transport_with([None])
+check("nothing heard yet", t.last_rx, 0.0)
+t.recv(timeout=0.2, maxlen=64)
+check("a read with no data leaves it alone", t.last_rx, 0.0)
+
+t = transport_with([bytes([0x41, 0x82, 0x83, 0x81])])
+t.recv(timeout=0.2, maxlen=64, expect=4)
+check("bytes arriving are timestamped", t.last_rx > 0, True)
+
+
+# --- LinkMonitor: when to probe, and what counts as an answer -------------- #
+class PingProto:
+    """Answers a probe with frames, with silence, or by raising."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.pings = 0
+
+    def ping(self):
+        self.pings += 1
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+class Heard:
+    def __init__(self, ago):
+        self.last_rx = time.monotonic() - ago
+
+
+alive = [{"raw": "7D 80 AC 81", "from_device": True, "instr": 61,
+          "input": 0, "output": 44, "machine": 1}]
+
+m = kv.LinkMonitor()
+check("the default heartbeat comes from one place", m.heartbeat, kv.HEARTBEAT)
+check("a long silence is due for a probe", m.due(Heard(1000)), True)
+check("recent bytes are not", m.due(Heard(1)), False)
+check("a heartbeat of 0 disables probing", kv.LinkMonitor(0).due(Heard(1000)),
+      False)
+check("no transport at all still counts as silence",
+      kv.LinkMonitor().due(None), True)
+
+# mark_ok is the other source of proof: a connection that has just proved itself
+# has not received anything yet.
+m = kv.LinkMonitor()
+m.mark_ok()
+check("marking it ok postpones the probe", m.due(Heard(1000)), False)
+
+# The whole reason this class exists: no reply is a failure, and it arrives
+# without an exception to notice.
+m = kv.LinkMonitor()
+p = PingProto([])
+check("an unanswered probe gives a reason", m.beat(p), "no reply to the "
+                                                       "liveness check")
+check("and it did send one", p.pings, 1)
+
+m = kv.LinkMonitor()
+check("an answered probe reports nothing wrong", m.beat(PingProto(alive)), None)
+check("and resets the timer", m.due(Heard(1000)), False)
+
+m = kv.LinkMonitor()
+try:
+    m.beat(PingProto(OSError("connection reset")))
+    check("a socket error propagates", "no exception", "OSError")
+except OSError:
+    check("a socket error propagates", "OSError", "OSError")
+
+# A retry loop must not repeat itself: a night with the matrix off would
+# otherwise bury everything that mattered under identical lines.
+m = kv.LinkMonitor()
+check("the first occurrence is reported", m.first_time("timed out"), True)
+check("the second is not", m.first_time("timed out"), False)
+check("a different failure is", m.first_time("no route to host"), True)
+m.mark_ok()
+check("and after a recovery the same one is reported again",
+      m.first_time("timed out"), True)
+
 
 failed = [line for ok, line in results if not ok]
 for ok, line in results:

@@ -6,3 +6,13 @@
 *.py   text diff=python
 *.md   text
 *.json text
+
+# These keep LF even in a working tree on Windows. A Dockerfile with CRLF is a
+# long-standing footgun - a line continuation inside RUN, or any shell script
+# added later, breaks in ways that read as a build problem rather than a line
+# ending problem - and YAML parsers are happier without the carriage returns.
+Dockerfile     text eol=lf
+.dockerignore  text eol=lf
+*.yml          text eol=lf
+*.yaml         text eol=lf
+*.sh           text eol=lf

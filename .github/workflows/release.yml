@@ -131,8 +131,14 @@ jobs:
       - name: Name it after the tag
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME}"
-          [ "${{ github.event_name }}" = "workflow_dispatch" ] && version="dev"
+          # REF_TYPE, not the event: on a branch push REF_NAME is the branch, and
+          # a branch name with a slash in it turns the cp below into a write to a
+          # directory that does not exist. Only a tag names a release.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="dev"
+          fi
           mkdir -p out
           ext=""
           case "${{ matrix.binary }}" in *.exe) ext=".exe" ;; esac

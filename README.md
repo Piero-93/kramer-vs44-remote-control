@@ -1,8 +1,9 @@
 <p align="center">
-  <img src="packaging/kramer.png" width="96" height="96" alt="">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="packaging/banner-dark.svg">
+    <img src="packaging/banner-light.svg" width="420" alt="Kramer VS-44HN Remote Control">
+  </picture>
 </p>
-
-<h1 align="center">kramer-vs44-remote-control</h1>
 
 <p align="center">
   Control a <strong>Kramer VS-44HN</strong> 4×4 HDMI matrix switcher over

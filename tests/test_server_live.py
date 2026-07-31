@@ -37,7 +37,18 @@ ap.add_argument("--matrix", default="192.168.1.39", metavar="HOST[:PORT]")
 ap.add_argument("--switch-output", type=int, choices=(1, 2, 3, 4), metavar="N",
                 help="also switch this output and restore it (CHANGES THE VIDEO "
                      "on that output for a few seconds)")
+ap.add_argument("--store-preset", type=int, metavar="N",
+                help="also verify storing, using preset slot N. OVERWRITES THAT "
+                     "SLOT permanently: pick an empty one. Requires "
+                     "--switch-output as well, since proving the slot really "
+                     "captured the layout means changing an output and "
+                     "recalling it back")
 args = ap.parse_args()
+if args.store_preset is not None:
+    if not 1 <= args.store_preset <= 8:
+        ap.error("--store-preset must be between 1 and 8")
+    if not args.switch_output:
+        ap.error("--store-preset also needs --switch-output")
 
 # Never touch the real configuration file.
 ks.CONFIG_PATH = Path(mkdtemp()) / "kramer_gui_config.json"
@@ -61,7 +72,8 @@ def wait_for(predicate, timeout):
 
 host, _, port = args.matrix.partition(":")
 link = ks.DeviceLink(host, int(port) if port else kv.DEFAULT_TCP_PORT)
-server = ks.Server(("127.0.0.1", 0), link)
+server = ks.Server(("127.0.0.1", 0), link,
+                   allow_preset_store=args.store_preset is not None)
 link.on_change = server.publish_state
 base = f"http://127.0.0.1:{server.server_address[1]}"
 threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -136,6 +148,25 @@ if args.switch_output:
     check("no other output moved",
           {o: state["routing"][o] for o in untouched},
           {o: routing[o] for o in untouched})
+
+    # --- optional: storing, proven by a round trip ------------------------- #
+    # A store that only flips the "slot is occupied" flag proves nothing about
+    # the layout being captured. Change an output, recall, and see it come back.
+    if args.store_preset is not None:
+        slot = args.store_preset
+        status, state = post(f"/api/preset/{slot}/store")
+        check(f"POST /api/preset/{slot}/store", status, 200)
+        check("the slot now reports as occupied", state["presets"][str(slot)], True)
+        events.get(timeout=10)
+
+        post("/api/route", {"input": other, "output": out})
+        events.get(timeout=10)
+        status, state = post(f"/api/preset/{slot}/recall")
+        check("recalling the slot restores the stored layout",
+              state["routing"], routing)
+        events.get(timeout=10)
+    else:
+        notes.append("store check skipped (pass --store-preset N to include it)")
 else:
     notes.append("switch check skipped (pass --switch-output N to include it)")
 

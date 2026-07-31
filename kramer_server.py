@@ -43,6 +43,8 @@ Endpoints
   PUT  /api/labels            update those names
   POST /api/route             {"input": n, "output": m}
   POST /api/preset/<n>/recall recall preset n, then re-read the routing
+  POST /api/preset/<n>/store  overwrite preset n with the current routing;
+                              refused with 403 unless --allow-preset-store
   GET  /api/events            Server-Sent Events: state changes as they happen
 """
 
@@ -138,11 +140,16 @@ class DeviceLink:
 
     IDLE_POLL = 0.2                 # seconds spent listening between jobs
     RECONNECT_DELAY = 3.0           # pause before retrying a failed connection
+    HEARTBEAT = 30.0                # seconds of silence before probing the link
 
-    def __init__(self, host, port, machine=1, on_change=None):
+    def __init__(self, host, port, machine=1, on_change=None, heartbeat=None):
         self.host, self.port, self.machine = host, port, machine
+        self.heartbeat = self.HEARTBEAT if heartbeat is None else heartbeat
+        self._last_ok = 0.0         # last time the matrix demonstrably answered
+        self._logged_error = None   # so a retry loop does not repeat itself
         self.on_change = on_change or (lambda: None)
         self.routing = {}           # {output: input}, 0 means disconnected
+        self.presets = {}           # {slot: bool}, True when the slot holds a layout
         self.connected = False
         self.detail = f"TCP {host}:{port}"
         self.error = None
@@ -180,12 +187,22 @@ class DeviceLink:
             raise value
         return value
 
+    def store_preset(self, n):
+        """Store the current routing into slot n, then refresh the occupancy map
+        so the UI can keep marking which slots hold a layout."""
+        def job(proto):
+            proto.preset_store(n)
+            return self._read_presets(proto)
+
+        self.presets = self.call(job, timeout=15.0)
+
     def snapshot(self):
         return {
             "connected": self.connected,
             "detail": self.detail,
             "protocol": self._proto.name if self._proto else None,
             "routing": {str(o): i for o, i in sorted(self.routing.items())},
+            "presets": {str(n): v for n, v in sorted(self.presets.items())},
             "error": self.error,
         }
 
@@ -200,9 +217,11 @@ class DeviceLink:
                 fn, box = self._jobs.get(timeout=self.IDLE_POLL)
             except queue.Empty:
                 self._listen()
+                self._maybe_beat()
                 continue
             try:
                 box.put((True, fn(self._proto)))
+                self._last_ok = time.monotonic()
             except OSError as e:
                 # A socket-level failure means the link is gone, not that the
                 # command was wrong: report it and start reconnecting.
@@ -224,22 +243,68 @@ class DeviceLink:
                                       "Protocol 2000")
             self._transport, self._proto = transport, proto
             self.routing = proto.status()
+            # Eight more commands, so it is read here and after a store, never
+            # per request. Knowing which slots are occupied is what lets the UI
+            # warn before overwriting one.
+            self.presets = self._read_presets(proto)
             self.connected = True
             self.error = None
-            log(f"connected to {self.detail} ({proto.name}), routing {self.routing}")
+            self._last_ok = time.monotonic()
+            self._logged_error = None
+            log(f"connected to {self.detail} ({proto.name}), routing {self.routing}, "
+                f"presets defined {sorted(n for n, v in self.presets.items() if v)}")
             self.on_change()
         except (OSError, ConnectionError) as e:
             self._close()
             self.error = str(e) or e.__class__.__name__
-            log(f"connection to {self.detail} failed: {self.error}")
+            # Retries are fast on purpose, so the same failure would otherwise
+            # fill the log with thousands of identical lines overnight. Say it
+            # once; the reconnection is logged when it happens.
+            if self.error != self._logged_error:
+                log(f"connection to {self.detail} failed: {self.error} "
+                    f"(retrying every {self.RECONNECT_DELAY:g}s, silently)")
+                self._logged_error = self.error
             self.on_change()
             self._stop.wait(self.RECONNECT_DELAY)
 
+    @staticmethod
+    def _read_presets(proto):
+        """Instruction 15 per slot: does this preset hold a layout?"""
+        return {n: bool(proto.preset_defined(n)) for n in range(1, N_PRESETS + 1)}
+
     def _listen(self):
         try:
-            self._proto.poll_notifications(self.IDLE_POLL)
+            if self._proto.poll_notifications(self.IDLE_POLL):
+                self._last_ok = time.monotonic()
+        except OSError as e:
+            # Includes the ConnectionError raised when the matrix closes the
+            # socket, which is the only drop that can be noticed passively.
+            self._drop(e)
+
+    def _maybe_beat(self):
+        """Probe the link after a stretch of silence.
+
+        A matrix switched off without closing its socket - a power cut, a pulled
+        cable - leaves a connection that looks perfectly healthy from this side:
+        reads simply time out, exactly as they do when the device is idle and has
+        nothing to say. Silence is therefore not evidence of anything, and has to
+        be probed.
+
+        Note that no reply is a failure just as much as an error is: the send
+        succeeds into the void and _cmd() returns an empty list without raising.
+        A liveness check that only watches for exceptions would never fire."""
+        if not self.heartbeat:
+            return
+        if time.monotonic() - self._last_ok < self.heartbeat:
+            return
+        try:
+            if self._proto.ping():
+                self._last_ok = time.monotonic()
+                return
         except OSError as e:
             self._drop(e)
+            return
+        self._drop("no reply to the liveness check")
 
     def _notified(self, frames):
         """Called on this thread by Protocol2000 for frames the matrix sent by
@@ -317,6 +382,7 @@ class EventHub:
 # --------------------------------------------------------------------------- #
 
 PRESET_RECALL = re.compile(r"^/api/preset/(\d+)/recall$")
+PRESET_STORE = re.compile(r"^/api/preset/(\d+)/store$")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -383,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             return self._serve_index()
         if path == "/api/state":
-            return self._json(200, self.server.link.snapshot())
+            return self._json(200, self.server.state_payload())
         if path == "/api/labels":
             return self._json(200, load_labels())
         if path == "/api/events":
@@ -420,6 +486,9 @@ class Handler(BaseHTTPRequestHandler):
         recall = PRESET_RECALL.match(path)
         if recall:
             return self._do_preset_recall(int(recall.group(1)))
+        store = PRESET_STORE.match(path)
+        if store:
+            return self._do_preset_store(int(store.group(1)))
         self._error(404, f"no such resource: {path}")
 
     # ----- handlers -------------------------------------------------------- #
@@ -435,7 +504,7 @@ class Handler(BaseHTTPRequestHandler):
         """One long-lived response per browser. ThreadingHTTPServer gives this
         request its own thread, so holding it open costs a thread and nothing
         else."""
-        link, hub = self.server.link, self.server.hub
+        hub = self.server.hub
         q = hub.subscribe()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -447,7 +516,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             # Send the current state at once: a browser that just connected must
             # not have to wait for something to change before it can draw.
-            self._sse(json.dumps({"type": "state", "state": link.snapshot()}))
+            self._sse(json.dumps({"type": "state",
+                                  "state": self.server.state_payload()}))
             while True:
                 try:
                     self._sse(q.get(timeout=SSE_KEEPALIVE))
@@ -489,7 +559,7 @@ class Handler(BaseHTTPRequestHandler):
             link.routing[out] = inp
         log(f"routed input {inp} to output {out} for {self.address_string()}")
         self.server.publish_state()
-        self._json(200, link.snapshot())
+        self._json(200, self.server.state_payload())
 
     def _do_preset_recall(self, n):
         if not 1 <= n <= N_PRESETS:
@@ -511,7 +581,30 @@ class Handler(BaseHTTPRequestHandler):
         log(f"recalled preset {n} for {self.address_string()}, "
             f"routing {link.routing}")
         self.server.publish_state()
-        self._json(200, link.snapshot())
+        self._json(200, self.server.state_payload())
+
+    def _do_preset_store(self, n):
+        """The only destructive operation exposed, so it is off unless the
+        service was started with --allow-preset-store. The confirmation in the
+        page is a courtesy; this is the actual gate."""
+        if not self.server.allow_preset_store:
+            return self._error(403, "storing presets is disabled: restart the "
+                                    "service with --allow-preset-store")
+        if not 1 <= n <= N_PRESETS:
+            return self._error(400, f"preset must be between 1 and {N_PRESETS}")
+        link = self.server.link
+        was_defined = link.presets.get(n)
+        try:
+            link.store_preset(n)
+        except ConnectionError as e:
+            return self._error(503, str(e))
+        except (TimeoutError, OSError) as e:
+            return self._error(504, str(e))
+        log(f"stored preset {n} for {self.address_string()} "
+            f"({'overwritten' if was_defined else 'was empty'}), "
+            f"routing {link.routing}")
+        self.server.publish_state()
+        self._json(200, self.server.state_payload())
 
     # ----- validation ------------------------------------------------------ #
 
@@ -553,14 +646,21 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, link, token=None):
+    def __init__(self, address, link, token=None, allow_preset_store=False):
         super().__init__(address, Handler)
         self.link = link
         self.hub = EventHub()
         self.token = token
+        self.allow_preset_store = allow_preset_store
+
+    def state_payload(self):
+        """Device state plus what this service permits, so the page can hide a
+        function it is not allowed to use instead of offering a dead button."""
+        return {**self.link.snapshot(),
+                "allow_preset_store": self.allow_preset_store}
 
     def publish_state(self):
-        self.hub.publish({"type": "state", "state": self.link.snapshot()})
+        self.hub.publish({"type": "state", "state": self.state_payload()})
 
 
 # --------------------------------------------------------------------------- #
@@ -581,12 +681,27 @@ def main():
     ap.add_argument("--port", type=int, default=8000, help="HTTP port (default 8000)")
     ap.add_argument("--token", help="require this token on every request "
                                     "(Authorization: Bearer, or ?token=)")
+    ap.add_argument("--allow-preset-store", action="store_true",
+                    help="allow overwriting the hardware presets; off by default "
+                         "because it is the only destructive operation here")
+    ap.add_argument("--heartbeat", type=float, default=DeviceLink.HEARTBEAT,
+                    metavar="SECONDS",
+                    help=f"probe the matrix after this much silence (default "
+                         f"{DeviceLink.HEARTBEAT:g}; 0 disables the check)")
     args = ap.parse_args()
 
     host, _, port = args.matrix.partition(":")
     link = DeviceLink(host, int(port) if port else kv.DEFAULT_TCP_PORT,
-                      args.machine)
-    server = Server((args.host, args.port), link, args.token)
+                      args.machine, heartbeat=args.heartbeat)
+    try:
+        server = Server((args.host, args.port), link, args.token,
+                        args.allow_preset_store)
+    except OSError as e:
+        # Almost always the port being taken. A traceback here tells the reader
+        # nothing they can act on, and this is the first thing that goes wrong.
+        log(f"cannot listen on {args.host}:{args.port} - {e}")
+        log("another copy may already be running; try --port with another number")
+        return 1
     link.on_change = server.publish_state
 
     if not INDEX.exists():
@@ -597,6 +712,11 @@ def main():
     log(f"serving http://{shown}:{args.port}/  (matrix {link.detail})")
     if not args.token:
         log("no token set: anyone on this network can switch the matrix")
+    if args.allow_preset_store:
+        log("preset storing is ENABLED: the hardware presets can be overwritten")
+    if not args.heartbeat:
+        log("liveness checking is disabled: a matrix switched off silently will "
+            "still be reported as connected")
     log("run only one controller at a time - see the README")
     try:
         server.serve_forever()

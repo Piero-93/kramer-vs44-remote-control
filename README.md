@@ -351,6 +351,39 @@ all, because it does not need one when it is the only controller.
 Pick one for a given session. The Tkinter GUI remains useful as a direct-connection fallback when
 the service is not running.
 
+### Noticing that the matrix is gone
+
+A connection that is up is not evidence that the device on the other end is
+alive, and this is worth spelling out because getting it wrong is easy and the
+symptom is a UI that lies.
+
+**A powered-off or unplugged matrix leaves a socket that looks perfectly
+healthy.** Reads simply time out — exactly as they do when the device is idle
+and has nothing to report. Measured by pulling the network cable: no
+end-of-stream, no error, nothing. Silence is not information.
+
+So the service **probes the link after a stretch of silence**, sending an
+identify command and dropping the connection if the answer does not come. Two
+details that decide whether such a check works at all:
+
+- **No reply is a failure, not just an error.** The command goes out into the
+  void and returns an empty result without raising anything. A check that only
+  watched for exceptions would report the link healthy forever.
+- **The probe only fires when nothing else has succeeded recently.** While the
+  matrix is being used, its answers are the proof of life and no extra traffic is
+  generated at all.
+
+If the matrix *does* close its socket, the transport reports that immediately
+rather than mistaking it for silence, so that case needs no waiting.
+
+Once the link is lost the service retries until it comes back, then re-reads the
+routing and the presets. **Expect the recovery to take a while:** after a network
+interruption the measured VS-44HN did not answer a new connection attempt for
+about **90 seconds**, considerably longer than the outage itself — plausibly
+because from its side the old connection was never closed either and still
+occupied a slot. Nothing is wrong if the log repeats `failed: timed out` for a
+minute or two.
+
 ### Options
 
 | Flag | Default | Meaning |
@@ -360,6 +393,8 @@ the service is not running.
 | `--host ADDR` | `0.0.0.0` | address to listen on; `127.0.0.1` keeps it on this machine only |
 | `--port N` | `8000` | HTTP port |
 | `--token STRING` | none | require this token on every request |
+| `--allow-preset-store` | off | permit overwriting the hardware presets |
+| `--heartbeat SECONDS` | `30` | probe the matrix after this much silence; `0` disables the check |
 
 ### Deliberate limits
 
@@ -377,11 +412,31 @@ These are choices, not oversights:
   touching the routes.
 - **Do not expose this to the internet.** There is no TLS and no rate limiting. If you need access
   from outside, put it behind a VPN.
-- **Started by hand.** Run it from a terminal, watch the log, stop it with Ctrl-C. Promoting it to a
-  scheduled task at logon is a five-minute job once you know you want it always on.
-- **Preset *storing*, front-panel lock, EDID and raw commands are not exposed.** Only routing and
-  preset *recall* are. `#FACTORY` deliberately has no endpoint at all, for the same reason it is not
-  a button in the GUI.
+- **Started by hand.** Run it from a terminal, watch the log, stop it with Ctrl-C.
+- **Front-panel lock, EDID and raw commands are not exposed.** `#FACTORY` deliberately has no
+  endpoint at all, for the same reason it is not a button in the GUI.
+- **Overwriting presets is off unless you ask for it** — see below.
+
+### Presets, and overwriting them
+
+Recalling a preset is a single tap and always available. **Storing** one is different: it replaces
+the slot's contents, and it is the only destructive operation the service exposes. It is therefore
+guarded three times over, from the outside in:
+
+1. **The endpoint does not work unless the service was started with `--allow-preset-store`.**
+   Without it, `POST /api/preset/<n>/store` answers `403` and the page does not offer the function
+   at all. Presets get configured once in a while: start with the flag on that day, and the rest of
+   the time nothing reachable on the network can destroy them. This is the real gate — the two
+   below are in the page, and a page's protections are trivially bypassed by anyone able to send a
+   POST.
+2. **The buttons do not switch roles behind your back.** "Overwrite a preset…" arms a distinct
+   mode, in which the preset buttons change colour and store instead of recall. Recall never sits
+   one mis-tap away from overwrite, which matters on a phone.
+3. **The confirmation says what will happen**, listing the routing about to be captured with your
+   own names, and stating whether the slot is empty or about to lose what it holds.
+
+The page also marks with a dot (**●**) every preset that already contains a layout. The service
+reads that at connect time with one query per slot, and refreshes it after a store.
 
 ### Configuration
 
@@ -397,22 +452,24 @@ wins — which is the same reason as above for using one controller at a time.
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "error"}`; `routing` maps output to input, `0` meaning disconnected |
+| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "presets", "error", "allow_preset_store"}`; `routing` maps output to input with `0` meaning disconnected, `presets` maps slot to whether it holds a layout |
 | `GET` | `/api/labels` | input, output and preset names |
 | `PUT` | `/api/labels` | any subset of `inputs`, `outputs`, `presets`; returns the complete set |
 | `POST` | `/api/route` | `{"input": 0-4, "output": 0-4}`; input `0` disconnects, output `0` means every output |
 | `POST` | `/api/preset/<n>/recall` | recalls preset 1-8, then re-reads the routing |
+| `POST` | `/api/preset/<n>/store` | overwrites preset 1-8 with the current routing; `403` unless `--allow-preset-store` |
 | `GET` | `/api/events` | Server-Sent Events; `{"type": "state"|"labels", ...}` |
 
-Status codes worth knowing: `400` for a malformed or out-of-range request, `503` when the matrix is
-not currently connected, `504` when it did not answer in time. The state endpoint keeps answering
-while the link is down and reports `"connected": false`, so a client can show the truth rather than
-a stale grid.
+Status codes worth knowing: `400` for a malformed or out-of-range request, `403` when preset storing
+is disabled, `503` when the matrix is not currently connected, `504` when it did not answer in time.
+The state endpoint keeps answering while the link is down and reports `"connected": false`, so a
+client can show the truth rather than a stale grid.
 
 ```bash
 curl http://localhost:8000/api/state
 curl -X POST http://localhost:8000/api/route -H 'Content-Type: application/json' -d '{"input":2,"output":3}'
 curl -X POST http://localhost:8000/api/preset/1/recall
+curl -X POST http://localhost:8000/api/preset/1/store    # needs --allow-preset-store
 curl -N http://localhost:8000/api/events
 ```
 
@@ -457,6 +514,11 @@ arp -a | findstr 192.168.1.39      # Linux/macOS: arp -a | grep 192.168.1.39
 ```
 
 If something answers, you have an IP conflict coming. Free the address first.
+
+Note the direction of that test: an answer means **something else** is on `.39`. It does not work the
+other way round — the measured VS-44HN does not reply to ICMP at all, so silence proves nothing
+about whether the matrix is there. To check for the matrix itself, test the port:
+`Test-NetConnection 192.168.1.39 -Port 5000` on Windows, `nc -z 192.168.1.39 5000` elsewhere.
 
 **Reset:** disconnect power, **hold the rear `RESET` button**, power the unit back on while
 keeping it held. The unit returns to `192.168.1.39 / 255.255.255.0`. This is a **safe**
@@ -513,7 +575,9 @@ Replies come back in the same 4-byte format with the DESTINATION bit set (`0x40`
 
 **Confirmed on real hardware** (VS-44HN, firmware 3.3, over TCP): `3D 81 80 81` (identify →
 `7D 80 AC 81`), `3D 83 80 81` (software version → `7D 83 83 81`, i.e. 3.3), `3E 8n 81 81`
-(define machine → 4 inputs, 4 outputs, 8 presets), `05 80 8n 81` (output status).
+(define machine → 4 inputs, 4 outputs, 8 presets), `05 80 8n 81` (output status), `0F 8n 80 81`
+(instruction 15, is preset *n* defined → the OUTPUT field of the reply is 1 for an occupied slot and
+0 for an empty one, cross-checked against a unit with exactly one preset saved).
 
 **Still derived from the bit layout only** — verify with `-v` before relying on it:
 `1E 81 80 81` (front-panel lock).
@@ -593,6 +657,7 @@ Maximum 64 characters per string. Commands can be concatenated with `|`.
 | `Worker.IDLE_POLL` | `0.2` | GUI, seconds spent listening between jobs |
 | `DeviceLink.IDLE_POLL` | `0.2` | service, seconds spent listening between jobs |
 | `DeviceLink.RECONNECT_DELAY` | `3.0` | service, pause before retrying a failed connection |
+| `DeviceLink.HEARTBEAT` | `30.0` | service, silence tolerated before probing the link |
 | `SSE_KEEPALIVE` | `15.0` | service, seconds between event-stream keepalives |
 | `SSE_BACKLOG` | `32` | service, events buffered per browser before dropping |
 
@@ -606,6 +671,10 @@ to 0.9 s**: it applies to every command, not just to the automatic refresh.
 If you add a command whose reply length you know, pass `expect`. If you do not know it, leave it
 out and accept the timeout — do not guess.
 
+A read that hits end of stream raises `ConnectionError` rather than returning empty, because a
+closed socket and an idle device are not the same thing and treating them alike is how a caller
+stays convinced it is talking to hardware that is gone.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -614,6 +683,9 @@ out and accept the timeout — do not guess.
 | No reply over TCP although the port is open | wrong protocol → try `--proto p2000` and `--proto p3000` |
 | `discover` finds nothing | static IP on another subnet → use the rear `RESET` button |
 | The matrix disappears from the network periodically | IP conflict: `.39` is inside the DHCP pool → reserve it |
+| `ping` gets no answer | **Not a verdict.** The measured unit does not reply to ICMP at all while happily accepting TCP on port 5000. Test the port, not the ping: `Test-NetConnection 192.168.1.39 -Port 5000` on Windows, `nc -z 192.168.1.39 5000` elsewhere |
+| It will not reconnect for a minute or two after a network interruption | Expected. The device took about 90 s to answer a new connection after the cable was restored |
+| The service says it is connected but nothing responds | Only possible with `--heartbeat 0`. Silence is indistinguishable from an idle device, so without the probe a dead link is never noticed |
 | Commands ignored when sent in bursts | you are going below 200 ms → do not work around `MIN_CMD_INTERVAL` |
 | The IR remote stopped responding | the unit is in Protocol 3000 → `proto-switch p2000` |
 | Truncated or mixed replies | dirty buffer — the tool calls `flush_input()`, but `raw` can leave residue |
@@ -664,10 +736,10 @@ These are deliberate choices, not accidents.
   `False`.
 - **Switches made by other software are not announced.** The device reports front-panel presses
   but not commands issued by another client, which is why only one controller should run at a time.
-- **The Tkinter GUI does not reconnect.** There is no socket-drop detection there: if the matrix is
-  powered off, the GUI still believes it is connected. Auto-refresh turns itself off on the first
-  error, which surfaces the problem, but the indicator stays green. The web service *does* detect a
-  dropped link and reconnect.
+- **The Tkinter GUI does not reconnect, and does not probe the link.** If the matrix closes its
+  socket the next read now fails, so auto-refresh turns itself off and says so — but if the matrix
+  dies *silently*, which is what pulling the cable produces, the GUI notices nothing until you ask
+  it to do something, and the indicator stays green. Only the web service probes for this.
 - **The web service has no authentication unless you set `--token`,** and no TLS in any case.
 - **The protocol layer has no unit tests yet.** The GUI and the state tracking are covered by
   `tests/`; frame generation and the parsing helpers are currently only exercised through

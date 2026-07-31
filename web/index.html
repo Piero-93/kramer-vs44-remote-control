@@ -67,6 +67,15 @@
     background: var(--accent); color: var(--accent-text);
     border-color: var(--accent); font-weight: 600;
   }
+  button.arm { border-color: var(--danger); color: var(--danger); }
+  button.arm.active {
+    background: var(--danger); color: #fff; border-color: var(--danger);
+    font-weight: 600;
+  }
+  .dot { color: var(--accent); font-size: .7em; vertical-align: .15em; }
+  button.arm .dot { color: currentColor; }
+  .hint { color: var(--muted); font-size: .85rem; }
+  .hint.warn { color: var(--danger); }
   #presets { display: grid; gap: .5rem; grid-template-columns: repeat(2, 1fr); }
   @media (min-width: 34rem) {
     #presets { grid-template-columns: repeat(4, 1fr); }
@@ -108,6 +117,10 @@
   <section>
     <h2>Presets</h2>
     <div id="presets"></div>
+    <div class="row" style="margin-top:.7rem">
+      <button id="arm" class="arm" hidden>Overwrite a preset…</button>
+      <span id="presetHint" class="hint"></span>
+    </div>
   </section>
 
   <section>
@@ -130,9 +143,12 @@
 const N_IO = 4, N_PRESETS = 8;
 const $ = (id) => document.getElementById(id);
 
-let state = { connected: false, routing: {}, detail: "", error: null };
+let state = { connected: false, routing: {}, presets: {}, detail: "", error: null };
 let labels = { inputs: [], outputs: [], presets: [] };
 let busy = false;
+// Storing overwrites a preset and is the only destructive action here, so it is
+// never one tap away from recalling: it needs this mode plus a confirmation.
+let armed = false;
 
 /* ---------- rendering ---------------------------------------------------- */
 
@@ -193,10 +209,39 @@ function renderPresets() {
   box.textContent = "";
   for (let n = 1; n <= N_PRESETS; n++) {
     const b = document.createElement("button");
-    b.textContent = labels.presets[n - 1];
+    b.append(labels.presets[n - 1]);
+    if (state.presets && state.presets[n]) {
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      dot.textContent = " ●";
+      dot.title = "holds a layout";
+      b.appendChild(dot);
+    }
     b.disabled = busy || !state.connected;
-    b.onclick = () => recall(n);
+    if (armed) {
+      b.classList.add("arm");
+      b.title = `Overwrite ${labels.presets[n - 1]} with the current routing`;
+      b.onclick = () => store(n);
+    } else {
+      b.title = `Recall ${labels.presets[n - 1]}`;
+      b.onclick = () => recall(n);
+    }
     box.appendChild(b);
+  }
+
+  const arm = $("arm");
+  arm.hidden = !state.allow_preset_store;
+  arm.classList.toggle("active", armed);
+  arm.textContent = armed ? "Cancel" : "Overwrite a preset…";
+  arm.disabled = busy || !state.connected;
+  const hint = $("presetHint");
+  hint.className = armed ? "hint warn" : "hint";
+  if (armed) {
+    hint.textContent = "Pick a preset to overwrite with the routing shown above.";
+  } else if (state.allow_preset_store) {
+    hint.textContent = "● marks a preset that already holds a layout.";
+  } else {
+    hint.textContent = "Overwriting presets is disabled on this service.";
   }
 }
 
@@ -242,6 +287,37 @@ async function recall(n) {
   const res = await send("POST", `/api/preset/${n}/recall`);
   if (res) { state = res; renderAll(); }
 }
+
+function routingSummary() {
+  const lines = [];
+  for (let o = 1; o <= N_IO; o++) {
+    const i = Number(state.routing[o]);
+    lines.push(`  ${labels.outputs[o - 1]} ← ` +
+               (i === 0 ? "nothing" : labels.inputs[i - 1]));
+  }
+  return lines.join("\n");
+}
+
+async function store(n) {
+  // Say what is about to happen, not just "are you sure": a warning nobody can
+  // act on is a warning everybody clicks through.
+  const name = labels.presets[n - 1];
+  const occupied = state.presets && state.presets[n];
+  const message =
+    `Store the current routing into "${name}"?\n\n${routingSummary()}\n\n` +
+    (occupied ? `"${name}" already holds a layout and it will be lost.`
+              : `"${name}" is currently empty.`);
+  if (!confirm(message)) return;
+  const res = await send("POST", `/api/preset/${n}/store`);
+  if (res) {
+    state = res;
+    armed = false;
+    renderAll();
+    $("presetHint").textContent = `Saved into "${name}".`;
+  }
+}
+
+$("arm").onclick = () => { armed = !armed; renderPresets(); };
 
 /* ---------- editing the names ------------------------------------------- */
 
@@ -314,7 +390,13 @@ function listen() {
   const stream = new EventSource("/api/events");
   stream.onmessage = (event) => {
     const msg = JSON.parse(event.data);
-    if (msg.type === "state") { state = msg.state; renderAll(); }
+    if (msg.type === "state") {
+      state = msg.state;
+      // Do not leave a destructive mode armed across a dropped link: the
+      // routing it was about to capture may no longer be the one shown.
+      if (!state.connected) armed = false;
+      renderAll();
+    }
     if (msg.type === "labels") { labels = msg.labels; renderAll(); }
   };
   stream.onerror = () => {

@@ -13,6 +13,7 @@ import json
 import queue
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -38,6 +39,8 @@ class FakeProto:
     def __init__(self):
         self.switches = []
         self.recalls = []
+        self.stores = []
+        self.defined = {4}
         self.routing = {1: 1, 2: 2, 3: 0, 4: 0}
 
     def switch(self, inp, out):
@@ -51,6 +54,13 @@ class FakeProto:
         self.recalls.append(n)
         self.routing = {1: 4, 2: 4, 3: 4, 4: 4}
 
+    def preset_store(self, n):
+        self.stores.append(n)
+        self.defined.add(n)
+
+    def preset_defined(self, n):
+        return n in self.defined
+
     def status(self):
         return dict(self.routing)
 
@@ -61,6 +71,7 @@ class FakeLink:
     def __init__(self):
         self.proto = FakeProto()
         self.routing = self.proto.status()
+        self.presets = {n: n in self.proto.defined for n in range(1, 9)}
         self.connected = True
         self.detail = "TCP 10.0.0.1:5000"
         self.error = None
@@ -73,10 +84,16 @@ class FakeLink:
             raise ConnectionError("not connected to the matrix")
         return fn(self.proto)
 
+    # Real implementation, borrowed so the occupancy refresh is exercised rather
+    # than faked away.
+    store_preset = ks.DeviceLink.store_preset
+    _read_presets = staticmethod(ks.DeviceLink._read_presets)
+
     def snapshot(self):
         return {"connected": self.connected, "detail": self.detail,
                 "protocol": self.proto.name if self.connected else None,
                 "routing": {str(o): i for o, i in sorted(self.routing.items())},
+                "presets": {str(n): v for n, v in sorted(self.presets.items())},
                 "error": self.error}
 
 
@@ -161,6 +178,42 @@ check("the routing was read back", payload["routing"],
 for n, code in ((0, 400), (9, 400), (99, 400)):
     status, payload = request("POST", f"/api/preset/{n}/recall")
     check(f"preset {n} rejected", status, code)
+
+# --- state reports which slots hold a layout ------------------------------- #
+status, payload = request("GET", "/api/state")
+check("occupied slots are reported", payload["presets"]["4"], True)
+check("empty ones too", payload["presets"]["1"], False)
+check("storing is off by default", payload["allow_preset_store"], False)
+
+# --- storing is refused unless the service was started for it -------------- #
+status, payload = request("POST", "/api/preset/2/store")
+check("store refused with 403", status, 403)
+check("with an actionable message",
+      "--allow-preset-store" in payload["error"], True)
+check("and nothing reached the device", link.proto.stores, [])
+
+server.allow_preset_store = True
+status, payload = request("GET", "/api/state")
+check("the capability is advertised", payload["allow_preset_store"], True)
+
+status, payload = request("POST", "/api/preset/2/store")
+check("POST /api/preset/2/store", status, 200)
+check("the store reached the device", link.proto.stores, [2])
+check("and the slot now shows as occupied", payload["presets"]["2"], True)
+check("while the others are unchanged", payload["presets"]["1"], False)
+check("an occupied slot stays occupied", payload["presets"]["4"], True)
+
+for n in (0, 9, 99):
+    status, payload = request("POST", f"/api/preset/{n}/store")
+    check(f"store into preset {n} rejected", status, 400)
+check("still only one store happened", link.proto.stores, [2])
+
+link.connected = False
+status, payload = request("POST", "/api/preset/3/store")
+check("store with no link is 503", status, 503)
+link.connected = True
+check("and it never reached the device", link.proto.stores, [2])
+server.allow_preset_store = False
 
 # --- labels ---------------------------------------------------------------- #
 status, payload = request("GET", "/api/labels")
@@ -284,6 +337,99 @@ for _ in range(ks.SSE_BACKLOG + 20):
     hub.publish({"type": "state"})
 check("events are dropped, not buffered without bound",
       stalled.qsize(), ks.SSE_BACKLOG)
+
+
+# --- the liveness check ---------------------------------------------------- #
+# A matrix switched off without closing its socket leaves reads timing out,
+# which is indistinguishable from an idle device. These checks cover the probe
+# that turns that silence into a verdict.
+
+class BeatProto:
+    name = "Protocol 2000"
+    on_notify = None
+
+    def __init__(self, answer):
+        self.answer = answer            # frames, [] for silence, or an exception
+        self.pings = 0
+
+    def ping(self):
+        self.pings += 1
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+    def poll_notifications(self, timeout=0.2):
+        return 0
+
+
+def beat_link(answer, heartbeat=30.0, silent_for=100.0):
+    dl = ks.DeviceLink("10.0.0.1", 5000, heartbeat=heartbeat)
+    dl._proto = BeatProto(answer)
+    dl.connected = True
+    dl._last_ok = time.monotonic() - silent_for
+    return dl
+
+
+alive = [{"raw": "7D 80 AC 81", "from_device": True, "instr": 61,
+          "input": 0, "output": 44, "machine": 1}]
+
+dl = beat_link(alive)
+dl._maybe_beat()
+check("a live matrix is probed once", dl._proto.pings, 1)
+check("and stays connected", dl.connected, True)
+check("and the silence timer is reset", time.monotonic() - dl._last_ok < 1, True)
+
+# The important case: the command goes out, nothing comes back, and _cmd returns
+# an empty list without raising. A check that only watched for exceptions would
+# report the link as healthy forever.
+dl = beat_link([])
+dl._maybe_beat()
+check("silence counts as a failure", dl.connected, False)
+check("and is explained", "liveness" in (dl.error or ""), True)
+
+dl = beat_link(OSError("connection reset"))
+dl._maybe_beat()
+check("a socket error drops the link too", dl.connected, False)
+
+dl = beat_link(ConnectionError("the device closed the connection"))
+dl._maybe_beat()
+check("so does the close reported by the transport", dl.connected, False)
+
+# No probing while the matrix is demonstrably answering: using it is proof enough.
+dl = beat_link(alive, silent_for=1.0)
+dl._maybe_beat()
+check("recent traffic means no probe", dl._proto.pings, 0)
+check("and the link is left alone", dl.connected, True)
+
+dl = beat_link(alive, heartbeat=0)
+dl._maybe_beat()
+check("heartbeat 0 disables the probe", dl._proto.pings, 0)
+
+# Anything the device says on its own also counts as proof of life.
+dl = beat_link(alive)
+dl._proto.poll_notifications = lambda timeout=0.2: 2
+dl._listen()
+check("an unsolicited frame resets the timer",
+      time.monotonic() - dl._last_ok < 1, True)
+dl._maybe_beat()
+check("so no probe follows it", dl._proto.pings, 0)
+
+
+# --- a retry loop must not repeat itself in the log ------------------------ #
+logged = []
+real_log = ks.log
+ks.log = logged.append
+try:
+    dl = ks.DeviceLink("203.0.113.1", 5000)     # reserved, never routed
+    dl.RECONNECT_DELAY = 0
+    dl._stop.set()                              # so wait() returns immediately
+    for _ in range(5):
+        dl._connect()
+finally:
+    ks.log = real_log
+check("the same failure is logged once", len(logged), 1)
+check("and says retries continue", "retrying" in logged[0], True)
+check("while the state still reports the error", dl.connected, False)
 
 server.shutdown()
 server.server_close()

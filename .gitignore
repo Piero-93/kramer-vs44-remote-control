@@ -20,6 +20,12 @@ kramer_gui_config.json
 handoff-*.md
 handoff/
 
+# --- Local deployment helpers, not part of the project ----------------------
+kramer-server.sh
+kramer-server.pid
+kramer-server.log
+kramer-server.log.*
+
 # --- Editors and tooling ----------------------------------------------------
 .claude/
 .vscode/

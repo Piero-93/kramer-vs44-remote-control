@@ -6,19 +6,21 @@ fixed order, and forcing that into per-test isolation would cost more than it cu
 
 | Script | Needs hardware | What it covers |
 |---|---|---|
+| `test_protocol_offline.py` | no | Frame generation against the byte sequences confirmed in the manual and on hardware, reply decoding, the `expect` shortcut, end-of-stream handling, and the separation of unsolicited frames from replies — driven through a fake socket |
 | `test_gui_offline.py` | no | Window construction, the passive-listener wiring, periodic-refresh scheduling and its guards, notification handling, config round-trip and sanitisation |
-| `test_server_offline.py` | no | Every HTTP route, request validation, the label round-trip and its read-modify-write, the token gate, the event stream, and that a stalled browser cannot block the device thread |
+| `test_server_offline.py` | no | Every HTTP route, request validation, the label round-trip and its read-modify-write, the token gate, the `--allow-preset-store` gate and the preset occupancy map, the event stream, and that a stalled browser cannot block the device thread |
 | `test_gui_live.py` | yes | The GUI worker against a live socket, the listener running in the idle gaps without stealing command replies, log muting, connect/disconnect |
 | `test_server_live.py` | yes | The service's device thread against a live socket, events end to end, and recovery after the link drops |
 
 ```bash
+python tests/test_protocol_offline.py
 python tests/test_gui_offline.py
 python tests/test_server_offline.py
 python tests/test_gui_live.py --host 192.168.1.39
 python tests/test_server_live.py --matrix 192.168.1.39
 ```
 
-All of them exit non-zero if any check fails, so any can gate a pull request. The two `*_offline`
+All of them exit non-zero if any check fails, so any can gate a pull request. The three `*_offline`
 scripts belong in CI; the live ones need a matrix on the network.
 
 On Windows and macOS Tkinter runs natively. On a headless Linux machine, use a virtual display:

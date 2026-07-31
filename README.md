@@ -284,17 +284,22 @@ python kramer_vs44.py --tcp 192.168.1.39 shell
 python kramer_gui.py
 python kramer_gui.py --host 192.168.1.50 --port 10001
 python kramer_gui.py --serial COM3
+python kramer_gui.py --config /path/to/settings.json
 ```
+
+Note that here `--host` is the **matrix** address, while `kramer_server.py --host` is the address
+that service listens on. Same word, different thing.
 
 The window offers a connection bar (network or serial, with protocol selection), a routing grid
 with one radio-button row per output, the 8 presets with recall/store buttons, a few utility
 actions, and a log panel showing every byte sent and received.
 
 Input, output and preset **labels are editable** and persisted, so the grid can read
-"Desktop → Left monitor" instead of "IN 1 → OUT 1". Settings are saved to
-`kramer_gui_config.json` next to the script when the window closes; the file is not tracked by
-git — copy `kramer_gui_config.example.json` if you want a starting point, or just let the app
-create it.
+"Desktop → Left monitor" instead of "IN 1 → OUT 1". Settings are written when the window closes, to
+the same file the web service uses and resolved the same way — see
+[Configuration, and where it lives](#configuration-and-where-it-lives). The file is not tracked by
+git; copy `kramer_gui_config.example.json` if you want a starting point, or just let the app create
+it. If the write fails you get a dialog saying so, rather than losing the names quietly.
 
 ### Staying in sync with the front panel
 
@@ -405,15 +410,27 @@ minute or two.
 
 ### Options
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--matrix HOST[:PORT]` | `192.168.1.39` | the matrix, TCP port 5000 implied |
-| `--machine N` | `1` | Protocol 2000 machine number |
-| `--host ADDR` | `0.0.0.0` | address to listen on; `127.0.0.1` keeps it on this machine only |
-| `--port N` | `8000` | HTTP port |
-| `--token STRING` | none | require this token on every request |
-| `--allow-preset-store` | off | permit overwriting the hardware presets |
-| `--heartbeat SECONDS` | `30` | probe the matrix after this much silence; `0` disables the check |
+| Flag | Environment | Default | Meaning |
+|---|---|---|---|
+| `--matrix HOST[:PORT]` | `KRAMER_MATRIX` | `192.168.1.39` | the matrix, TCP port 5000 implied |
+| `--machine N` | `KRAMER_MACHINE` | `1` | Protocol 2000 machine number |
+| `--host ADDR` | `KRAMER_HOST` | `0.0.0.0` | address **this service** listens on, not the matrix; `127.0.0.1` keeps it on this machine only |
+| `--port N` | `KRAMER_PORT` | `8000` | HTTP port for this service |
+| `--token STRING` | `KRAMER_TOKEN` | none | require this token on every request |
+| `--allow-preset-store` | `KRAMER_ALLOW_PRESET_STORE` | off | permit overwriting the hardware presets |
+| `--heartbeat SECONDS` | `KRAMER_HEARTBEAT` | `30` | probe the matrix after this much silence; `0` disables the check |
+| `--config PATH` | `KRAMER_CONFIG` | see below | settings file to use |
+| `--version` | | | print the version and exit |
+
+Every option can come from its environment variable instead, which is what makes the service
+pleasant to configure in a container form field. **A flag always wins** when both are given: the
+environment only supplies the default, so there is no precedence rule to remember. A variable left
+blank counts as unset, because that is what an empty form field sends.
+
+Two traps in that table worth naming. `--host` is *this service's* listen address, while
+`kramer_gui.py --host` is the *matrix* address — same word, different thing.
+`KRAMER_ALLOW_PRESET_STORE` can only switch preset storing **on**: an absent flag is not a flag that
+says "off", so to disable it again you clear the variable.
 
 ### Deliberate limits
 
@@ -459,15 +476,34 @@ guarded three times over, from the outside in:
 The page also marks with a dot (**●**) every preset that already contains a layout. The service
 reads that at connect time with one query per slot, and refreshes it after a store.
 
-### Configuration
+### Configuration, and where it lives
 
 Input, output and preset names are read from — and written to — **the same
 `kramer_gui_config.json` that the Tkinter GUI uses**, so both interfaces show the names you set
 once. "Edit names" in the browser writes them back.
 
-Writes are read-modify-write on both sides: neither program discards keys it does not own. That
-does *not* make them safe to run at once — for the names they both manage, the last writer still
-wins — which is the same reason as above for using one controller at a time.
+Both programs resolve that one file the same way, highest precedence first:
+
+1. `--config PATH`
+2. the `KRAMER_CONFIG` environment variable
+3. **a `kramer_gui_config.json` already sitting next to the program** — portable mode. This is what a
+   source checkout has, so running from a clone behaves exactly as it always did, with nothing to
+   migrate
+4. otherwise the per-user directory: `%APPDATA%\kramer-vs44\` on Windows,
+   `${XDG_CONFIG_HOME:-~/.config}/kramer-vs44/` elsewhere
+
+The resolved path is printed at startup. That single log line is there so that "where did my names
+go" is a question you can answer by looking, rather than by investigating.
+
+Writes are read-modify-write on both sides, so neither program discards keys it does not own, and
+they are atomic: the new file is written beside the old one and then renamed over it, so an
+interrupted write cannot leave you with a truncated settings file. None of that makes the two safe
+to run at once — for the names they both manage the last writer still wins — which is the same
+reason as above for using one controller at a time.
+
+If the settings location cannot be written — a read-only volume, most likely — the service still
+works completely; only renaming fails, with an error that names the path. Nothing is accepted in
+memory and silently lost, because a rename that evaporates on restart is worse than a refusal.
 
 ### API
 
@@ -482,7 +518,10 @@ wins — which is the same reason as above for using one controller at a time.
 | `GET` | `/api/events` | Server-Sent Events; `{"type": "state"|"labels", ...}` |
 
 Status codes worth knowing: `400` for a malformed or out-of-range request, `403` when preset storing
-is disabled, `503` when the matrix is not currently connected, `504` when it did not answer in time.
+is disabled, `500` when the settings file cannot be written, `503` when the matrix is not currently
+connected, `504` when it did not answer in time. Note that `500` and `503` mean genuinely different
+things here — the first is a service installed wrong, the second is hardware that is not answering —
+so they are never used interchangeably.
 The state endpoint keeps answering while the link is down and reports `"connected": false`, so a
 client can show the truth rather than a stale grid.
 

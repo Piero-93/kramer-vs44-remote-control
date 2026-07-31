@@ -37,12 +37,13 @@ def check(name, got, want):
 
 root = tk.Tk()
 app = g.App(root, g.load_config(),
-            argparse.Namespace(host=None, port=None, serial=None))
+            argparse.Namespace(host=None, port=None, serial=None,
+                               heartbeat=g.kv.HEARTBEAT))
 
 # The worker thread is already running and drains the queue immediately, so
 # inspecting jobs.qsize() would be a race. Record the submissions instead.
 submitted = []
-app.worker.submit = lambda tag, fn: submitted.append(tag)
+app.worker.submit = lambda tag, fn, **kw: submitted.append(tag)
 
 
 # --- widgets built and labelled -------------------------------------------- #
@@ -73,44 +74,168 @@ app._apply_notifications([])
 check("an empty batch does nothing", app.log.get("1.0", "end").strip(), "")
 
 
-# --- worker attach/detach wiring ------------------------------------------- #
+# --- the worker owns the link ---------------------------------------------- #
+class _FakeTransport:
+    def __init__(self, heard_ago=0.0):
+        self.last_rx = g.time.monotonic() - heard_ago
+        self.muted = False
+        self.closed = False
+
+    def set_muted(self, muted):
+        self.muted = muted
+
+    def close(self):
+        self.closed = True
+
+
 class _FakeProto:
     name = "fake"
     on_notify = None
 
-    def __init__(self):
+    def __init__(self, answer=None):
+        self.answer = answer
         self.polls = 0
+        self.pings = 0
 
     def poll_notifications(self, timeout=0.2):
         self.polls += 1
         return 0
 
+    def ping(self):
+        self.pings += 1
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
 
-class _BrokenProto(_FakeProto):
-    def poll_notifications(self, timeout=0.2):
-        self.polls += 1
-        raise OSError("socket gone")
+
+def drain(worker):
+    out = []
+    while True:
+        try:
+            out.append(worker.results.get_nowait())
+        except g.queue.Empty:
+            return out
 
 
-worker = g.Worker(g.queue.Queue())
-fake = _FakeProto()
-worker.attach("transport-stub", fake, "callback-stub")
-check("attach stores the transport", worker.transport, "transport-stub")
-check("attach wires on_notify", fake.on_notify, "callback-stub")
-worker._listen()
-check("idle listen polls the protocol", fake.polls, 1)
+def linked(answer=None, heartbeat=30.0, heard_ago=0.0):
+    """A worker holding a link, without any of it being real."""
+    w = g.Worker(g.queue.Queue(), heartbeat=heartbeat)
+    w.transport = _FakeTransport(heard_ago)
+    w.proto = _FakeProto(answer)
+    w.want_link = True
+    w.monitor.mark_ok()
+    w.monitor._last_ok = g.time.monotonic() - heard_ago
+    return w
 
-broken = _BrokenProto()
-worker.attach("transport-stub", broken, None)
-worker._listen()
-worker._listen()
-worker._listen()
-check("a broken link is polled only once", broken.polls, 1)
-check("and the failure is reported once", worker.results.qsize(), 1)
-worker.detach()
-check("detach clears the protocol", worker.proto, None)
-worker._listen()
-check("no polling once detached", broken.polls, 1)
+
+alive = [{"raw": "7D 80 AC 81", "from_device": True, "instr": 61,
+          "input": 0, "output": 44, "machine": 1}]
+
+w = linked()
+w._listen()
+check("an idle worker listens", w.proto.polls, 1)
+
+# A decoding bug is not a link failure: reconnecting cannot fix it, and letting
+# it escape would kill the thread and leave the window silently inert.
+w = linked()
+w.proto.poll_notifications = lambda timeout=0.2: (_ for _ in ()).throw(
+    ValueError("bad frame"))
+w._listen()
+w._listen()
+w._listen()
+check("a bug while listening is reported once", len(drain(w)), 1)
+check("and does not drop the link", w.proto is not None, True)
+
+# A socket error is a link failure, and must start the reconnection.
+w = linked()
+w.proto.poll_notifications = lambda timeout=0.2: (_ for _ in ()).throw(
+    OSError("socket gone"))
+w._listen()
+events = drain(w)
+check("a socket error drops the link", w.proto, None)
+check("and says it is retrying",
+      [(t, r["retrying"]) for t, r, _ in events], [("link_down", True)])
+check("and the transport was closed", w.transport, None)
+
+# --- the liveness probe, mirroring the service ----------------------------- #
+w = linked(answer=alive, heard_ago=1000)
+w._maybe_beat()
+check("a quiet link is probed", w.proto.pings, 1)
+check("and stays up when it answers", w.proto is not None, True)
+check("the probe is not written to the byte log", w.transport.muted, False)
+
+# The case the whole design exists for: the probe is sent, nothing comes back,
+# and no exception is raised.
+w = linked(answer=[], heard_ago=1000)
+w._maybe_beat()
+check("silence counts as a failure", w.proto, None)
+check("with a reason that says so",
+      "liveness" in drain(w)[0][1]["reason"], True)
+
+w = linked(answer=OSError("reset"), heard_ago=1000)
+w._maybe_beat()
+check("a socket error during the probe drops it too", w.proto, None)
+
+w = linked(answer=alive, heard_ago=1)
+w._maybe_beat()
+check("recent bytes mean no probe", w.proto.pings, 0)
+
+w = linked(answer=alive, heartbeat=0, heard_ago=1000)
+w._maybe_beat()
+check("heartbeat 0 disables it", w.proto.pings, 0)
+
+# The trap that does not exist in the service: this program refreshes on the
+# same period as it probes, so if a job that returned nothing counted as proof
+# of life the probe would never fire at all.
+w = linked(answer=[], heard_ago=1000)
+w.transport.last_rx = 0.0
+check("a read that answered nothing does not postpone the probe",
+      w.monitor.due(w.transport), True)
+
+# --- reconnecting ----------------------------------------------------------- #
+attempts = []
+
+
+def flaky_connector():
+    attempts.append(1)
+    if len(attempts) < 3:
+        raise OSError("timed out")
+    return _FakeTransport(), _FakeProto(alive), "TCP 10.0.0.1:5000 — fake"
+
+
+w = g.Worker(g.queue.Queue())
+w.RECONNECT_DELAY = 0
+w.link(flaky_connector, None)
+w._down_since = g.time.monotonic() - 5      # pretend a link existed and died
+w._connect()
+w._connect()
+w._connect()
+events = drain(w)
+check("it kept retrying", len(attempts), 3)
+check("the same failure is reported once, not per attempt",
+      [t for t, _, _ in events].count("link_retry"), 1)
+check("and then it comes up", [t for t, _, _ in events][-1], "link_up")
+check("flagged as a reconnection", events[-1][1]["relink"], True)
+
+# A first attempt that fails must not start a retry loop behind a typo.
+w = g.Worker(g.queue.Queue())
+w.link(lambda: (_ for _ in ()).throw(OSError("no route to host")), None)
+w._connect()
+events = drain(w)
+check("a first failure is reported as connect", events[0][0], "connect")
+check("and stops asking", w.want_link, False)
+
+# A queued action with no link fails fast instead of reaching a missing protocol.
+# The loop is run inline: the job first, then the sentinel that ends it.
+ran = []
+w = g.Worker(g.queue.Queue())
+w.submit("switch", lambda _w: ran.append("ran"))
+w.jobs.put(None)
+w.run()
+tag, res, err = w.results.get_nowait()
+check("an action with no link fails fast", (tag, type(err).__name__),
+      ("switch", "ConnectionError"))
+check("and the action itself never ran", ran, [])
 
 # --- scheduling: never armed while disconnected ---------------------------- #
 app.autorefresh.set(True)
@@ -204,9 +329,18 @@ check("allowed again after the result", submitted, ["status_auto"])
 # An error must clear it too, or the automatic refresh would jam for good.
 app._handle("status_auto", None, RuntimeError("boom"))
 check("pending cleared by an error", app._auto_pending, False)
-check("an error turns the periodic refresh off", app.autorefresh.get(), False)
-app.autorefresh.set(True)
+# It used to switch the checkbox off, which was a stand-in for the missing
+# reconnection. Now a real failure drops the link and the indicator says so, so
+# the user's setting is never touched behind their back.
+check("an error leaves the setting alone", app.autorefresh.get(), True)
 app._auto_pending = False
+
+# And an automatic read that fails only because the link is already down should
+# not add a line saying what the indicator is already showing.
+before_log = app.log.get("1.0", "end")
+app._handle("status_auto", None, ConnectionError("the link is down"))
+check("a read refused for a known-down link is not logged",
+      app.log.get("1.0", "end"), before_log)
 
 # --- a manual read is never suppressed by a pending automatic one ---------- #
 app._auto_pending = True
@@ -263,6 +397,60 @@ app._apply_status({1: 1, 2: 2, 3: 3, 4: 2}, quiet=True)
 check("grid follows the device", app.route_vars[4].get(), 2)
 check("the change is logged",
       "changed on the device: {4: 2}" in app.log.get("1.0", "end"), True)
+
+# --- what the window does when the link goes away -------------------------- #
+app.connected = True
+app.link_state = "up"
+app.connect_btn.configure(text="Disconnect")
+for o in range(1, 5):
+    app.route_vars[o].set(o)
+app.autorefresh.set(True)
+app.log.delete("1.0", "end")
+
+
+def colour_of(widget):
+    """cget("foreground") hands back a Tcl colour object, not a string."""
+    return str(widget.cget("foreground"))
+
+app._handle("link_down", {"reason": "no reply to the liveness check",
+                          "retrying": True}, None)
+check("a lost link is not 'connected'", app.connected, False)
+check("but it is not idle either", app.link_state, "reconnecting")
+check("the button still offers to stop it",
+      app.connect_btn.cget("text"), "Disconnect")
+# A greyed-out radio button still reads as set, and the front panel can move
+# things while we are not looking. Showing nothing is the honest state.
+check("the grid stops claiming a routing",
+      [v.get() for v in app.route_vars.values()], [-1, -1, -1, -1])
+check("the indicator counts the wait",
+      "reconnecting" in app.status.cget("text"), True)
+check("it is amber, not green or red", colour_of(app.status), "#a70")
+check("and the reason is logged once",
+      app.log.get("1.0", "end").count("link lost"), 1)
+check("the user's refresh setting is untouched", app.autorefresh.get(), True)
+check("with no pending automatic read left over", app._auto_pending, False)
+
+app._handle("link_retry", {"error": "timed out"}, None)
+check("a retry adds one line", "still trying: timed out"
+      in app.log.get("1.0", "end"), True)
+
+submitted.clear()
+app._handle("link_up", {"detail": "TCP 10.0.0.1:5000 — fake", "relink": True,
+                        "elapsed": 92}, None)
+check("coming back marks it connected", app.connected, True)
+check("and up", app.link_state, "up")
+check("the indicator shows the link", app.status.cget("text"),
+      "● TCP 10.0.0.1:5000 — fake")
+check("green again", colour_of(app.status), "#2a7")
+check("the outage length is logged",
+      "reconnected after 92s" in app.log.get("1.0", "end"), True)
+check("and the routing is read again immediately", submitted, ["status"])
+
+# A deliberate disconnect is a different thing from a lost link.
+app._handle("link_down", {"reason": "disconnected", "retrying": False}, None)
+check("a deliberate disconnect goes idle", app.link_state, "idle")
+check("and the button offers to connect", app.connect_btn.cget("text"),
+      "Connect")
 
 # --- config round-trip ---------------------------------------------------- #
 app.autorefresh_secs.set("30")

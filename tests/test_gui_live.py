@@ -28,6 +28,7 @@ from tempfile import mkdtemp
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import kramer_gui as g
+import kramer_vs44 as kv
 
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 ap.add_argument("--host", default="192.168.1.39", help="matrix IP address")
@@ -35,6 +36,11 @@ ap.add_argument("--port", type=int, help="TCP port (5000, 10001 or 50000)")
 ap.add_argument("--switch-output", type=int, choices=(1, 2, 3, 4), metavar="N",
                 help="also switch this output and restore it (CHANGES THE VIDEO "
                      "on that output for a few seconds)")
+ap.add_argument("--drop-link", action="store_true",
+                help="also close the socket under the worker and check that the "
+                     "window notices and reconnects. Takes a while: the matrix "
+                     "has been measured refusing a new connection for about 90 "
+                     "seconds after one is lost")
 args = ap.parse_args()
 
 # Never touch the real configuration file.
@@ -50,7 +56,8 @@ def check(name, got, want):
 
 root = tk.Tk()
 app = g.App(root, g.load_config(),
-            argparse.Namespace(host=args.host, port=args.port, serial=None))
+            argparse.Namespace(host=args.host, port=args.port, serial=None,
+                               heartbeat=kv.HEARTBEAT))
 
 # Record which results land, so the waits are driven by what happened rather than
 # by a guess about how slow the device is.
@@ -114,7 +121,7 @@ check("mute flag released", app.worker.transport._muted, False)
 
 # --- the passive listener is wired up ------------------------------------- #
 check("on_notify wired after connect", callable(app.worker.proto.on_notify), True)
-check("listener not marked broken", app.worker._listen_broken, False)
+check("the link is up, not merely 'not failed'", app.link_state, "up")
 
 # --- repeated reads stay correct with the listener running in between ----- #
 # Between reads the worker sits in poll_notifications(). If that stole replies,
@@ -148,6 +155,34 @@ if args.switch_output:
 else:
     notes.append("switch check skipped (pass --switch-output N to include it)")
 
+# --- losing the link and getting it back ---------------------------------- #
+# Closing the socket under the worker is the closest a test can get to pulling
+# the cable. What matters is that the window stops claiming a routing it can no
+# longer verify, and repairs itself without anyone clicking anything.
+if args.drop_link:
+    app.worker.transport.close()
+    went_down = pump(30, until=lambda: app.link_state == "reconnecting")
+    check("the window notices the link is gone", went_down, True)
+    check("and stops calling itself connected", app.connected, False)
+    check("the grid stops claiming a routing",
+          set(v.get() for v in app.route_vars.values()), {-1})
+    check("the indicator says what is happening",
+          "reconnecting" in app.status.cget("text"), True)
+    check("and the button still offers to stop it",
+          app.connect_btn.cget("text"), "Disconnect")
+
+    started = time.monotonic()
+    back = pump(180, until=lambda: app.link_state == "up")
+    check("it reconnects on its own", back, True)
+    if back:
+        notes.append(f"reconnected after {time.monotonic() - started:.0f}s")
+        check("and reads the routing again",
+              pump(30, until=lambda: any(v.get() >= 0
+                                         for v in app.route_vars.values())),
+              True)
+else:
+    notes.append("link-drop check skipped (pass --drop-link to include it)")
+
 # --- the periodic timer arms and is cancelled on disconnect --------------- #
 app.autorefresh.set(True)
 app._schedule_autorefresh()
@@ -156,6 +191,7 @@ check("timer armed against a live device", app._autorefresh_job is not None, Tru
 app._toggle_connect()
 pump(10, until=lambda: not app.connected)
 check("disconnects cleanly", app.connected, False)
+check("and goes idle rather than retrying", app.link_state, "idle")
 check("timer cancelled after disconnect", app._autorefresh_job, None)
 
 app.autorefresh.set(False)

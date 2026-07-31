@@ -482,11 +482,23 @@ class BeatProto:
         return 0
 
 
+class BeatTransport:
+    """Stands in for a transport, carrying only the one thing liveness reads:
+    when bytes last arrived from the device."""
+
+    def __init__(self, heard_ago):
+        self.last_rx = time.monotonic() - heard_ago
+
+    def close(self):
+        pass
+
+
 def beat_link(answer, heartbeat=30.0, silent_for=100.0):
     dl = ks.DeviceLink("10.0.0.1", 5000, heartbeat=heartbeat)
     dl._proto = BeatProto(answer)
+    dl._transport = BeatTransport(silent_for)
     dl.connected = True
-    dl._last_ok = time.monotonic() - silent_for
+    dl.monitor._last_ok = time.monotonic() - silent_for
     return dl
 
 
@@ -497,7 +509,8 @@ dl = beat_link(alive)
 dl._maybe_beat()
 check("a live matrix is probed once", dl._proto.pings, 1)
 check("and stays connected", dl.connected, True)
-check("and the silence timer is reset", time.monotonic() - dl._last_ok < 1, True)
+check("and the silence timer is reset", dl.monitor.silent_for(dl._transport) < 1,
+      True)
 
 # The important case: the command goes out, nothing comes back, and _cmd returns
 # an empty list without raising. A check that only watched for exceptions would
@@ -525,14 +538,31 @@ dl = beat_link(alive, heartbeat=0)
 dl._maybe_beat()
 check("heartbeat 0 disables the probe", dl._proto.pings, 0)
 
-# Anything the device says on its own also counts as proof of life.
+# Bytes arriving are what counts as proof of life, wherever they came from - a
+# reply, or a front-panel press the device announced by itself. The transport
+# records that as they arrive, so nothing has to remember to say so.
 dl = beat_link(alive)
-dl._proto.poll_notifications = lambda timeout=0.2: 2
-dl._listen()
-check("an unsolicited frame resets the timer",
-      time.monotonic() - dl._last_ok < 1, True)
+dl._transport.last_rx = time.monotonic()
 dl._maybe_beat()
-check("so no probe follows it", dl._proto.pings, 0)
+check("bytes just received mean no probe", dl._proto.pings, 0)
+check("and the link is left alone", dl.connected, True)
+
+# The trap this whole design exists for: a job that "succeeded" without the
+# device answering must NOT postpone the probe. A dead-but-open link returns
+# {1: None, 2: None, ...} from a state read, and a program that reads as often as
+# it probes would otherwise never probe at all.
+dl = beat_link([])
+dl._transport.last_rx = 0.0          # nothing has ever arrived
+check("a silent link is still due for a probe",
+      dl.monitor.due(dl._transport), True)
+dl._maybe_beat()
+check("and the probe drops it", dl.connected, False)
+
+# Listening does not need to update anything itself: whatever arrives goes
+# through the transport, which timestamps it.
+dl = beat_link(alive)
+dl._listen()
+check("listening leaves the link alone", dl.connected, True)
 
 
 # --- a retry loop must not repeat itself in the log ------------------------ #

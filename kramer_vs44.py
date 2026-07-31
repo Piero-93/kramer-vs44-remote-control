@@ -61,6 +61,9 @@ DEFAULT_TCP_PORT = 5000
 DISCOVER_PORTS = (5000, 10001, 50000)
 BAUD = 9600                      # identical for both protocols on the VS-44HN
 
+HEARTBEAT = 30.0                 # silence tolerated before probing a link
+RECONNECT_DELAY = 3.0            # pause before retrying a failed connection
+
 # Protocol 2000: instruction 56 (0x38), output=3 -> switch to Protocol 3000
 P2000_TO_P3000 = bytes([0x38, 0x80, 0x83, 0x81])
 
@@ -77,6 +80,10 @@ class Transport:
         self.dry_run = dry_run
         self._last_tx = 0.0
         self._next_gap = MIN_CMD_INTERVAL
+        # When the device last actually said something. Recorded here rather than
+        # by callers because it is the only honest measure of the link being
+        # alive: a command can return without the device having answered at all.
+        self.last_rx = 0.0
 
     def _throttle(self):
         delta = time.monotonic() - self._last_tx
@@ -105,8 +112,10 @@ class Transport:
         if self.dry_run:
             return b""
         data = self._read(timeout, maxlen, expect)
-        if self.verbose and data:
-            print(f"  RX <- {hexdump(data)}   {printable(data)}")
+        if data:
+            self.last_rx = time.monotonic()
+            if self.verbose:
+                print(f"  RX <- {hexdump(data)}   {printable(data)}")
         return data
 
     def flush_input(self):
@@ -418,6 +427,72 @@ class Protocol3000:
     def factory(self):
         """DESTRUCTIVE: wipes the whole configuration, presets and EDID included."""
         return self.cmd("FACTORY")
+
+
+# --------------------------------------------------------------------------- #
+# Deciding whether a quiet link is still alive
+# --------------------------------------------------------------------------- #
+
+class LinkMonitor:
+    """When to probe a silent link, and whether it answered.
+
+    Both programs that hold a connection open need this, and it is subtle enough
+    that two copies of it would eventually disagree about something that matters.
+    Two traps are encoded here, both learned the hard way:
+
+    **No reply is a failure exactly as much as an error is.** When the matrix is
+    dead but TCP has not noticed, the command goes out into the void and _cmd()
+    returns an empty list without raising anything. A check that only watches for
+    exceptions reports the link healthy forever.
+
+    **Liveness is anchored on bytes received, not on commands that returned.** A
+    state read of a dead-but-open link "succeeds" with every value None. Counting
+    that as proof of life would reset the timer on every automatic refresh, and a
+    program that refreshes as often as it probes would never probe at all - which
+    is precisely the situation a heartbeat exists for.
+    """
+
+    def __init__(self, heartbeat=None):
+        self.heartbeat = HEARTBEAT if heartbeat is None else heartbeat
+        self._last_ok = 0.0
+        self._logged_error = None
+
+    def mark_ok(self):
+        """Record proof of life: a connection just proved itself, or a probe was
+        answered. Also clears the repeated-error memory, so a failure after a
+        recovery is reported again rather than swallowed as a duplicate."""
+        self._last_ok = time.monotonic()
+        self._logged_error = None
+
+    def silent_for(self, transport):
+        """Seconds since the device last demonstrated it was there."""
+        heard = max(self._last_ok, getattr(transport, "last_rx", 0.0))
+        return time.monotonic() - heard
+
+    def due(self, transport):
+        """Whether the link has been quiet long enough to be worth probing.
+        A heartbeat of 0 disables the check entirely."""
+        return bool(self.heartbeat) and self.silent_for(transport) >= self.heartbeat
+
+    def beat(self, proto):
+        """Send the probe. Returns None when the link answered, or a reason when
+        it did not. An OSError from the transport propagates: the caller treats a
+        socket failure and a silent device the same way, but the message differs."""
+        if proto.ping():
+            self.mark_ok()
+            return None
+        return "no reply to the liveness check"
+
+    def first_time(self, text):
+        """True the first time this error text is seen since the last mark_ok.
+
+        A reconnect loop retries every few seconds, so without this a night with
+        the matrix switched off produces thousands of identical lines and the log
+        becomes useless for finding what actually happened."""
+        if text == self._logged_error:
+            return False
+        self._logged_error = text
+        return True
 
 
 # --------------------------------------------------------------------------- #

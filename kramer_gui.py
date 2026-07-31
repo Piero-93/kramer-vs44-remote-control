@@ -93,8 +93,21 @@ def load_config():
 
 
 def save_config(cfg):
+    """Merge into what is already on disk instead of overwriting the file.
+
+    kramer_server.py writes the labels to this same file, so a blind overwrite
+    would silently discard keys this program does not know about. It does not
+    make the two safe to run at once - for the keys they both own, the last
+    writer still wins - which is why only one controller should be running."""
     try:
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False),
+        data = {}
+        if CONFIG_PATH.exists():
+            try:
+                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+        data.update(cfg)
+        CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False),
                                encoding="utf-8")
     except Exception as e:
         print(f"Could not save the config: {e}")

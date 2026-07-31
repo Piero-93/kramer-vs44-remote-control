@@ -28,6 +28,7 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 - [Quick start](#quick-start)
 - [Command-line usage](#command-line-usage)
 - [GUI](#gui)
+- [Web service and browser UI](#web-service-and-browser-ui)
 - [First-time setup](#first-time-setup)
 - [Protocol reference](#protocol-reference)
 - [Troubleshooting](#troubleshooting)
@@ -56,8 +57,12 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
   between commands, and that guarantee is enforced in one place instead of being scattered
   across call sites.
 - **GUI**: routing grid, named presets, editable input/output labels, live TX/RX byte log.
-- **No dependencies** for TCP and GUI use — Tkinter ships with Python. `pyserial` is needed
-  only for RS-232.
+- **Web service**: an HTTP API and a browser UI, so the matrix can be driven from a phone with
+  nothing installed on it. Front-panel presses are pushed to the page over Server-Sent Events, and
+  the connection to the matrix is re-established by itself if it drops.
+- **No dependencies at all** for TCP, GUI and web use — Tkinter and `http.server` ship with Python,
+  and the browser UI is one self-contained HTML file with no framework and no build step.
+  `pyserial` is needed only for RS-232.
 
 ## Know this before you touch the device
 
@@ -319,6 +324,102 @@ what provides immediacy. Both the checkbox and the interval are persisted.
 
 `#FACTORY` is deliberately **not** exposed as a button — see [Design notes](#design-notes).
 
+## Web service and browser UI
+
+`kramer_server.py` exposes an HTTP API and serves a single-page UI, so the matrix can be driven
+from a phone, a tablet or another machine with nothing installed on it.
+
+```bash
+python kramer_server.py
+python kramer_server.py --matrix 192.168.1.50:10001 --port 8080
+```
+
+It prints the URL to open. The page is `web/index.html`, one self-contained file with no framework,
+no build step and no external request: commands go out with `fetch()`, state arrives over
+Server-Sent Events, and both are native browser features.
+
+### ⚠️ Run one controller at a time
+
+**Do not run the web service and the Tkinter GUI against the matrix simultaneously.** This is not
+about the device refusing two connections — it accepts them. It is about what it reports: the
+matrix announces **front-panel presses** to every connected client, but **never a switch commanded
+by another client**. So each controller sees the front panel correctly and is blind to the other's
+commands, and whichever one you are not looking at will show routing that is quietly wrong. The
+Tkinter GUI's periodic re-read will eventually reconcile; the browser UI has no periodic read at
+all, because it does not need one when it is the only controller.
+
+Pick one for a given session. The Tkinter GUI remains useful as a direct-connection fallback when
+the service is not running.
+
+### Options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--matrix HOST[:PORT]` | `192.168.1.39` | the matrix, TCP port 5000 implied |
+| `--machine N` | `1` | Protocol 2000 machine number |
+| `--host ADDR` | `0.0.0.0` | address to listen on; `127.0.0.1` keeps it on this machine only |
+| `--port N` | `8000` | HTTP port |
+| `--token STRING` | none | require this token on every request |
+
+### Deliberate limits
+
+These are choices, not oversights:
+
+- **Protocol 2000 over TCP only.** Protocol 2000 is the factory default, it keeps the IR remote
+  working, and it is the only mode in which the matrix reports front-panel presses — which is what
+  lets this service push changes instead of polling. Protocol 3000 would gain nothing here and lose
+  that. RS-232 is not wired up either: it would be a handful of lines, but shipping a code path
+  that has never been run on real hardware is worse than not shipping it.
+- **No authentication by default.** The service is meant for a network you trust. As printed at
+  startup, **anyone who can reach the port can switch your monitors**. `--token STRING` requires
+  that token on every request, sent either as `Authorization: Bearer STRING` or as `?token=STRING`.
+  Every request passes through a single gate, so a login page can be added there later without
+  touching the routes.
+- **Do not expose this to the internet.** There is no TLS and no rate limiting. If you need access
+  from outside, put it behind a VPN.
+- **Started by hand.** Run it from a terminal, watch the log, stop it with Ctrl-C. Promoting it to a
+  scheduled task at logon is a five-minute job once you know you want it always on.
+- **Preset *storing*, front-panel lock, EDID and raw commands are not exposed.** Only routing and
+  preset *recall* are. `#FACTORY` deliberately has no endpoint at all, for the same reason it is not
+  a button in the GUI.
+
+### Configuration
+
+Input, output and preset names are read from — and written to — **the same
+`kramer_gui_config.json` that the Tkinter GUI uses**, so both interfaces show the names you set
+once. "Edit names" in the browser writes them back.
+
+Writes are read-modify-write on both sides: neither program discards keys it does not own. That
+does *not* make them safe to run at once — for the names they both manage, the last writer still
+wins — which is the same reason as above for using one controller at a time.
+
+### API
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "error"}`; `routing` maps output to input, `0` meaning disconnected |
+| `GET` | `/api/labels` | input, output and preset names |
+| `PUT` | `/api/labels` | any subset of `inputs`, `outputs`, `presets`; returns the complete set |
+| `POST` | `/api/route` | `{"input": 0-4, "output": 0-4}`; input `0` disconnects, output `0` means every output |
+| `POST` | `/api/preset/<n>/recall` | recalls preset 1-8, then re-reads the routing |
+| `GET` | `/api/events` | Server-Sent Events; `{"type": "state"|"labels", ...}` |
+
+Status codes worth knowing: `400` for a malformed or out-of-range request, `503` when the matrix is
+not currently connected, `504` when it did not answer in time. The state endpoint keeps answering
+while the link is down and reports `"connected": false`, so a client can show the truth rather than
+a stale grid.
+
+```bash
+curl http://localhost:8000/api/state
+curl -X POST http://localhost:8000/api/route -H 'Content-Type: application/json' -d '{"input":2,"output":3}'
+curl -X POST http://localhost:8000/api/preset/1/recall
+curl -N http://localhost:8000/api/events
+```
+
+Every request is serialised onto the single thread that owns the socket. Concurrent callers queue;
+they never interleave commands, because doing so would break the 200 ms interval the protocol
+requires.
+
 ## First-time setup
 
 ### 1. Identify the device over serial
@@ -490,6 +591,10 @@ Maximum 64 characters per string. Commands can be concatenated with `|`.
 | `AUTOREFRESH_INTERVALS` | `(5, 10, 30, 60)` | GUI, seconds |
 | `FOCUS_REFRESH_MIN_GAP` | `1.5` | GUI, throttles refresh-on-focus |
 | `Worker.IDLE_POLL` | `0.2` | GUI, seconds spent listening between jobs |
+| `DeviceLink.IDLE_POLL` | `0.2` | service, seconds spent listening between jobs |
+| `DeviceLink.RECONNECT_DELAY` | `3.0` | service, pause before retrying a failed connection |
+| `SSE_KEEPALIVE` | `15.0` | service, seconds between event-stream keepalives |
+| `SSE_BACKLOG` | `32` | service, events buffered per browser before dropping |
 
 ### A note on read timing
 
@@ -539,7 +644,15 @@ These are deliberate choices, not accidents.
    messier than the reverse.
 7. **In the GUI grid, outputs are rows and inputs are columns.** The physical constraint is
    "each output has exactly one input", so the radio group belongs to the output, and a row is
-   read in the natural direction.
+   read in the natural direction. The browser UI keeps the same convention.
+8. **The web service holds its connection open permanently.** Not for speed: the matrix reports
+   front-panel presses only to a client that is connected and reading, so a connect-per-request
+   design would see nothing. That is also why the service has to detect a dropped link and repair
+   it itself.
+9. **One controller at a time**, for the reason in
+   [Run one controller at a time](#️-run-one-controller-at-a-time). The alternative — making every
+   interface a client of one owning process — is real work with no benefit until you actually run
+   two at once.
 
 ## Known limitations
 
@@ -550,10 +663,12 @@ These are deliberate choices, not accidents.
   (out 4, in 1) the assumption holds; if it appears on (out 1, in 4), set the constant to
   `False`.
 - **Switches made by other software are not announced.** The device reports front-panel presses
-  but not commands issued by another client, so those are only picked up by the periodic re-read.
-- **No TCP reconnection.** There is currently no socket-drop detection: if the matrix is powered
-  off, the GUI still believes it is connected. Auto-refresh does turn itself off on the first
-  error, which surfaces the problem, but the connection indicator stays green.
+  but not commands issued by another client, which is why only one controller should run at a time.
+- **The Tkinter GUI does not reconnect.** There is no socket-drop detection there: if the matrix is
+  powered off, the GUI still believes it is connected. Auto-refresh turns itself off on the first
+  error, which surfaces the problem, but the indicator stays green. The web service *does* detect a
+  dropped link and reconnect.
+- **The web service has no authentication unless you set `--token`,** and no TLS in any case.
 - **The protocol layer has no unit tests yet.** The GUI and the state tracking are covered by
   `tests/`; frame generation and the parsing helpers are currently only exercised through
   `--dry-run` and against hardware.
@@ -563,17 +678,15 @@ These are deliberate choices, not accidents.
 
 - **OS-level hotkeys** binding preset recall to a key combination — the original motivation for
   the project. A resident helper may be needed if Python's startup time is noticeable.
-- **REST API** exposing routing and presets over HTTP. Note the hard constraint: every request
-  must be serialised through a single command queue, otherwise the 200 ms protocol rate limit is
-  violated by concurrent requests.
-- **Web GUI** on top of that API, so the matrix can be controlled from a phone or tablet without
-  installing anything.
-- **TCP robustness**: keepalive, timeout, automatic return to a disconnected state.
+- **Reconnection in the Tkinter GUI**, which the web service already does.
 - **Protocol unit tests**: `parse_raw`, `parse_vid_reply`, `hexdump`, and Protocol 2000 frame
-  generation compared against the verified byte sequences above. The GUI side already has
-  coverage in [`tests/`](tests/).
-- **Reconnection after a socket drop**, which would also restore passive listening automatically
-  instead of leaving it disabled until the user reconnects.
+  generation compared against the verified byte sequences above. The GUI and the service already
+  have coverage in [`tests/`](tests/).
+- **A login page for the web UI**, if it ever needs to leave a trusted network. The request gate is
+  already one function; sessions and cookies are the work.
+- **Making the Tkinter GUI a client of the HTTP API** instead of opening a second direct
+  connection — the only way both interfaces could run at once without either going stale.
+- **Serial transport and Protocol 3000 in the web service**, neither wired up today.
 - **Preset contents in the UI**: store the routing snapshot locally so each preset shows what it
   actually does (`#PRST-VID?` can read it back from the device on Protocol 3000).
 

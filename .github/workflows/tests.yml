@@ -5,6 +5,9 @@ name: tests
 # the push run has already produced.
 on:
   push:
+  # So the release workflow can gate the binaries on these same checks instead of
+  # assuming some other run was green on the same commit.
+  workflow_call:
 
 # Deliberately no concurrency group: cancelling a superseded run saves seconds
 # that nobody needs here, and costs a commit with no verdict of its own.

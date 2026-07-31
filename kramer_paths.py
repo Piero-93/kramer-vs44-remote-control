@@ -140,7 +140,12 @@ def read_json(path, on_error=None):
     through on_error, if given, and then ignored: a bad settings file must not
     stop the program from starting."""
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        # utf-8-sig, not utf-8: a Windows editor - Notepad, or PowerShell's
+        # Set-Content -Encoding UTF8 - writes a byte-order mark, and json.loads
+        # refuses it. Anyone hand-editing this file on Windows would otherwise
+        # silently get the defaults back. The suffix is harmless on a file that
+        # has no BOM, and writing still produces plain UTF-8 without one.
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:

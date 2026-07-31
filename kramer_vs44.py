@@ -44,6 +44,7 @@ Examples
   python kramer_vs44.py --serial COM3 proto-switch p3000
   python kramer_vs44.py --serial COM3 --proto p3000 device-info
   python kramer_vs44.py --tcp 192.168.1.39 shell
+  python kramer_vs44.py --tcp 192.168.1.39 --proto p2000 listen
   python kramer_vs44.py --serial COM3 raw "#HELP"
 """
 
@@ -95,10 +96,15 @@ class Transport:
             self._write(data)
         self._last_tx = time.monotonic()
 
-    def recv(self, timeout=1.0, maxlen=512) -> bytes:
+    def recv(self, timeout=1.0, maxlen=512, expect=None) -> bytes:
+        """expect is the reply length in bytes, when it is known in advance.
+        Without it a binary reply cannot be recognised as complete - it has no
+        terminator - so the read can only end by timing out. Protocol 2000
+        replies are always 4 bytes, and declaring that turns a 1 s wait per
+        command into no wait at all."""
         if self.dry_run:
             return b""
-        data = self._read(timeout, maxlen)
+        data = self._read(timeout, maxlen, expect)
         if self.verbose and data:
             print(f"  RX <- {hexdump(data)}   {printable(data)}")
         return data
@@ -106,12 +112,12 @@ class Transport:
     def flush_input(self):
         if not self.dry_run:
             try:
-                self._read(0.15, 4096)
+                self._read(0.15, 4096, None)
             except Exception:
                 pass
 
     def _write(self, data): raise NotImplementedError
-    def _read(self, timeout, maxlen): raise NotImplementedError
+    def _read(self, timeout, maxlen, expect=None): raise NotImplementedError
     def close(self): pass
 
     def __enter__(self): return self
@@ -129,7 +135,7 @@ class TcpTransport(Transport):
     def _write(self, data):
         self.sock.sendall(data)
 
-    def _read(self, timeout, maxlen):
+    def _read(self, timeout, maxlen, expect=None):
         self.sock.settimeout(timeout)
         buf = b""
         deadline = time.monotonic() + timeout
@@ -141,6 +147,8 @@ class TcpTransport(Transport):
             if not chunk:
                 break
             buf += chunk
+            if expect and len(buf) >= expect:
+                break
             if buf.endswith(b"\r\n") or len(buf) >= maxlen:
                 break
         return buf
@@ -170,13 +178,15 @@ class SerialTransport(Transport):
         self.ser.write(data)
         self.ser.flush()
 
-    def _read(self, timeout, maxlen):
+    def _read(self, timeout, maxlen, expect=None):
         deadline = time.monotonic() + timeout
         buf = b""
         while time.monotonic() < deadline:
             chunk = self.ser.read(maxlen)
             if chunk:
                 buf += chunk
+                if expect and len(buf) >= expect:
+                    break
                 if buf.endswith(b"\r\n"):
                     break
             elif buf:
@@ -205,6 +215,10 @@ class Protocol2000:
     def __init__(self, transport, machine=1):
         self.t = transport
         self.machine = machine
+        # Optional callable(frames) for frames the device sent on its own.
+        # Verified on a VS-44HN: pressing a front-panel button transmits a
+        # SWITCH VIDEO frame to a connected client, unprompted.
+        self.on_notify = None
 
     def _frame(self, instr, inp=0, out=0):
         return bytes([instr & 0x3F, 0x80 | (inp & 0x7F),
@@ -214,7 +228,34 @@ class Protocol2000:
         self.t.send(self._frame(instr, inp, out))
         if not expect_reply:
             return None
-        return self._decode(self.t.recv(timeout=1.0, maxlen=64))
+        # Unsolicited frames are indistinguishable from replies by shape, so the
+        # instruction number is what separates them: keep the frames carrying the
+        # instruction just sent, hand the others to on_notify, and read again if
+        # only notifications turned up. Without the retry, a button pressed
+        # during a read would leave the real reply sitting in the buffer and every
+        # later command would be one answer behind.
+        deadline = time.monotonic() + 1.0
+        while True:
+            # A reply is one 4-byte frame: saying so avoids waiting out the timeout.
+            frames = self._decode(self.t.recv(timeout=1.0, maxlen=64, expect=4))
+            reply = [f for f in frames if f["instr"] == instr]
+            other = [f for f in frames if f["instr"] != instr]
+            if other and self.on_notify:
+                self.on_notify(other)
+            # Retry only when frames arrived and none of them was the answer.
+            # Nothing at all means the read already spent its timeout - or that
+            # this is a dry run - so looping again would just burn CPU.
+            if reply or not frames or time.monotonic() >= deadline:
+                return reply
+
+    def poll_notifications(self, timeout=0.2):
+        """Read whatever the device sent on its own and pass it to on_notify.
+        Sends nothing, so the command interval is not involved. Returns the
+        number of frames dispatched."""
+        frames = self._decode(self.t.recv(timeout=timeout, maxlen=64))
+        if frames and self.on_notify:
+            self.on_notify(frames)
+        return len(frames)
 
     @staticmethod
     def _decode(raw):
@@ -303,6 +344,12 @@ class Protocol3000:
 
     def __init__(self, transport, machine=1):
         self.t = transport
+        self.on_notify = None
+
+    def poll_notifications(self, timeout=0.2):
+        """Protocol 3000 has no documented unsolicited message, and none has
+        been observed. Present so callers need no isinstance check."""
+        return 0
 
     def cmd(self, text, timeout=1.5):
         if not text.startswith("#"):
@@ -449,6 +496,51 @@ def list_serial_ports():
         print(f"  {p.device:12s} {p.description}")
 
 
+def listen(proto, transport, seconds=None):
+    """Passively print whatever the device transmits on its own.
+
+    The manual states that the unit echoes the switching codes when the
+    front-panel buttons are pressed, which would make the state readable
+    without polling. It does NOT say whether this also happens on the Ethernet
+    port: this command is how you find out. Nothing is ever sent, so the
+    200 ms command interval is not involved."""
+    is_p3 = isinstance(proto, Protocol3000)
+    deadline = None if seconds is None else time.monotonic() + seconds
+    print(f"\nListening on {transport} ({proto.name}).")
+    print("Press the front-panel buttons to see whether anything arrives.")
+    print(f"Stopping after {seconds} s." if seconds else "Ctrl-C to stop.")
+
+    buf = b""
+    count = 0
+    try:
+        while deadline is None or time.monotonic() < deadline:
+            data = transport.recv(timeout=0.5, maxlen=256)
+            if not data:
+                continue
+            if is_p3:
+                count += 1
+                print(f"  {printable(data)}")
+                continue
+            buf += data
+            while len(buf) >= 4:
+                frame, buf = buf[:4], buf[4:]
+                f = Protocol2000._decode(frame)[0]
+                count += 1
+                print(f"  {f['raw']}  instr={f['instr']:<2d} in={f['input']:<2d} "
+                      f"out={f['output']:<2d} machine={f['machine']}  "
+                      f"{'from device' if f['from_device'] else 'from PC'}")
+    except KeyboardInterrupt:
+        print()
+
+    if buf:
+        print(f"  {len(buf)} trailing byte(s), incomplete frame: {hexdump(buf)}")
+    print(f"{count} message(s) received.")
+    if not count:
+        print("Nothing arrived. Either the device does not notify on this transport,\n"
+              "or no front-panel button was pressed while listening.")
+    return count
+
+
 def shell(proto, transport):
     print(f"\nInteractive shell on {transport} ({proto.name}).")
     print("  <in> <out>    route an input to an output (out 0 = all)")
@@ -516,6 +608,11 @@ def build_parser():
     sub.add_parser("help-cmds", help="ask the device for its supported commands (P3000 only)")
     sub.add_parser("ports", help="list the available serial ports")
     sub.add_parser("shell", help="interactive shell")
+
+    li = sub.add_parser("listen",
+                        help="passively print what the device transmits by itself")
+    li.add_argument("--seconds", type=int,
+                    help="stop after N seconds instead of waiting for Ctrl-C")
 
     sw = sub.add_parser("switch", help="route an input to an output")
     sw.add_argument("input", type=int, help="1-4 (0 = disconnect)")
@@ -621,6 +718,8 @@ def main():
             t.send(parse_raw(args.data))
             data = t.recv(1.5)
             print(hexdump(data), "|", printable(data))
+        elif args.cmd == "listen":
+            listen(proto, t, args.seconds)
         elif args.cmd == "shell":
             shell(proto, t)
 

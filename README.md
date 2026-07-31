@@ -11,11 +11,11 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 ![License](https://img.shields.io/badge/license-GPLv3-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 
-> **Status.** Verified against the official VS-44HN manual (P/N 2900-300161 Rev 8) and used on
-> real hardware over LAN. Should also work on the **VS-44H**, which shares the protocol, but
-> that model has not been tested. Some byte sequences are derived from the protocol bit layout
-> rather than from an explicit manual example — they are marked as such in
-> [Protocol reference](#protocol-reference).
+> **Status.** Verified against the official VS-44HN manual (P/N 2900-300161 Rev 8) and exercised
+> on real hardware over LAN: a VS-44HN running firmware **3.3**, reporting 4 inputs, 4 outputs
+> and 8 presets. Should also work on the **VS-44H**, which shares the protocol, but that model
+> has not been tested. One byte sequence is still derived from the bit layout rather than
+> observed — it is marked as such in [Protocol reference](#protocol-reference).
 
 ---
 
@@ -214,6 +214,17 @@ python kramer_vs44.py --tcp 192.168.1.39 device-info         # model, firmware, 
 python kramer_vs44.py --serial COM3 --proto p3000 help-cmds  # supported commands (P3000 only)
 ```
 
+`listen` prints whatever the device sends on its own, without ever transmitting, which makes it
+the way to check whether front-panel presses are reported over a given transport:
+
+```bash
+python kramer_vs44.py --tcp 192.168.1.39 --proto p2000 listen              # until Ctrl-C
+python kramer_vs44.py --serial COM3 --proto p2000 listen --seconds 30      # bounded
+```
+
+Pass `--proto p2000` explicitly: protocol auto-detection would send an identify frame first, and
+the point of this command is a silent line.
+
 ### Routing
 
 ```bash
@@ -277,6 +288,34 @@ Input, output and preset **labels are editable** and persisted, so the grid can 
 `kramer_gui_config.json` next to the script when the window closes; the file is not tracked by
 git — copy `kramer_gui_config.example.json` if you want a starting point, or just let the app
 create it.
+
+### Staying in sync with the front panel
+
+The grid mirrors the physical matrix through two mechanisms, in that order of importance.
+
+**1. Passive listening, always on.** While no command is running, the worker reads whatever the
+device sends by itself. Press a button on the front panel and the grid follows within a fraction
+of a second, with the change reported in the log as `changed on the device: {3: 4}`. This costs
+**nothing on the bus** — it only listens — so it is not tied to any setting. See
+[Unsolicited notifications](#unsolicited-notifications-measured-and-asymmetric) for the measured
+behaviour this relies on.
+
+**2. The Auto checkbox: a periodic re-read as a safety net.** Listening cannot catch everything —
+a switch commanded by other software on the network is never announced, and a frame can be missed
+across a socket drop. The periodic read reconciles, and is deliberately restrained:
+
+- it runs **only while the window is visible** and pauses when minimised, so a panel parked on a
+  side monitor stays current without spending bus time once it is put away;
+- it **re-reads immediately when the window regains focus**, throttled so alt-tabbing cannot turn
+  into a burst;
+- a new read is **never queued while the previous one is still running**;
+- the byte log is **muted** during automatic reads and only **differences** are reported, so the
+  log stays a record of real events instead of a wall of identical state dumps;
+- on the first error it **switches itself off** with a log line, rather than repeating the same
+  failure every few seconds.
+
+Interval choices are 5, 10, 30 and 60 seconds, default 30 — slow on purpose, since the listener is
+what provides immediacy. Both the checkbox and the interval are persisted.
 
 `#FACTORY` is deliberately **not** exposed as a button — see [Design notes](#design-notes).
 
@@ -366,21 +405,52 @@ byte4 = 1 OVR X M4..M0  machine number (1 -> 0x81)
 | IDENTIFY MACHINE | 61 | video name = `3D 81 80 81` |
 | DEFINE MACHINE | 62 | output count = `3E 82 81 81` |
 
-Replies come back in the same 4-byte format with the DESTINATION bit set (`0x40`). The unit
-**also transmits when you press the front-panel buttons**, which means the state can be read
-passively, with no polling — useful for a dashboard that keeps itself in sync.
+Replies come back in the same 4-byte format with the DESTINATION bit set (`0x40`).
 
 **Confirmed against explicit examples in the manual:** `01 82 83 81` (switch), `04 81 80 81`
 (recall preset), `38 80 83 81` (change to ASCII).
 
-**Derived from the bit layout, not confirmed by a manual example** — verify with `-v` before
-relying on them: `1E 81 80 81` (panel lock), `3D 81 80 81` (identify), `3E 82 81 81` (define
-machine), `05 80 81 81` (output status).
+**Confirmed on real hardware** (VS-44HN, firmware 3.3, over TCP): `3D 81 80 81` (identify →
+`7D 80 AC 81`), `3D 83 80 81` (software version → `7D 83 83 81`, i.e. 3.3), `3E 8n 81 81`
+(define machine → 4 inputs, 4 outputs, 8 presets), `05 80 8n 81` (output status).
 
-> **Careful with `status` on Protocol 2000.** NOTE 4 of the manual, describing the OUTPUT field
-> of the reply, is ambiguously worded. Cross-check the value you read against the front-panel
-> 7-segment display before trusting it. Protocol 3000's `#VID?` is less open to interpretation,
-> and that is the one serious argument in favour of Protocol 3000 here.
+**Still derived from the bit layout only** — verify with `-v` before relying on it:
+`1E 81 80 81` (front-panel lock).
+
+> **`status` semantics on Protocol 2000: resolved.** NOTE 4 of the manual, describing the OUTPUT
+> field of the reply, is ambiguously worded, so it was checked on hardware. The OUTPUT field of
+> the reply carries **the input routed to the queried output**, and `0` means the output is
+> disconnected. Measured: with output 3 disconnected, `05 80 83 81` replies `45 80 80 81`; after
+> routing input 2 to output 3, the same query replies with the input in that field. The reply is
+> therefore not an echo of the request.
+
+### Unsolicited notifications: measured, and asymmetric
+
+The manual states that the unit transmits the switching codes when the front-panel buttons are
+pressed. Measured on a VS-44HN over TCP, that is true — **but only for the front panel**:
+
+| Event | Reported to a connected TCP client? |
+|---|---|
+| A front-panel button is pressed | **Yes.** An unprompted SWITCH VIDEO frame arrives, e.g. `41 84 83 81` = input 4 to output 3 |
+| Another TCP client issues `switch` | **No.** A listener on a second socket saw nothing while two switches were performed |
+
+So the state of the physical panel can be followed with no polling at all, which is what the GUI
+does. Changes made by other software on the network cannot, and need a periodic re-read.
+
+Two useful side findings from the same tests:
+
+- **The VS-44HN accepts at least two simultaneous TCP connections**, both fully functional.
+- **An unsolicited frame is indistinguishable from a command reply by shape.** Both are 4 bytes
+  with the DESTINATION bit set, and a front-panel switch produces exactly what a `switch` command
+  replies. Only the instruction number separates them, which is why `Protocol2000._cmd()` keeps
+  the frames matching the instruction it sent and routes the rest to an `on_notify` callback. Code
+  that ignores this will eventually read a notification as an answer.
+
+To check the behaviour on your own unit, run this and press a few front-panel buttons:
+
+```bash
+python kramer_vs44.py --tcp 192.168.1.39 --proto p2000 listen --seconds 60
+```
 
 ### Protocol 3000 — ASCII
 
@@ -417,6 +487,19 @@ Maximum 64 characters per string. Commands can be concatenated with `|`.
 | `DISCOVER_PORTS` | `(5000, 10001, 50000)` | |
 | `BAUD` | `9600` | same for both protocols |
 | `P2000_TO_P3000` | `38 80 83 81` | instruction 56 |
+| `AUTOREFRESH_INTERVALS` | `(5, 10, 30, 60)` | GUI, seconds |
+| `FOCUS_REFRESH_MIN_GAP` | `1.5` | GUI, throttles refresh-on-focus |
+| `Worker.IDLE_POLL` | `0.2` | GUI, seconds spent listening between jobs |
+
+### A note on read timing
+
+A binary reply has no terminator, so a read can only end by timing out — unless the expected
+length is known. `Transport.recv()` therefore takes an `expect` argument, and Protocol 2000
+declares its 4-byte replies. Measured on hardware, this took a full state read from **4.4 s down
+to 0.9 s**: it applies to every command, not just to the automatic refresh.
+
+If you add a command whose reply length you know, pass `expect`. If you do not know it, leave it
+out and accept the timeout — do not guess.
 
 ## Troubleshooting
 
@@ -438,7 +521,10 @@ These are deliberate choices, not accidents.
    of truth for the wire format.
 2. **All I/O runs on a single worker thread.** This is not a style preference: the 200 ms rate
    limit is enforced by the `Transport` object, so two concurrent threads would violate the
-   protocol timing. Any extension must go through the existing job queue.
+   protocol timing. Any extension must go through the existing job queue — including the passive
+   listener, which runs in the idle gaps of that same loop rather than in a thread of its own.
+   The notification callback fires on the worker thread and therefore only queues a result; it
+   never touches Tk.
 3. **`#FACTORY` is not exposed in the GUI.** It is the only command that destroys presets and
    EDID, and it must not sit one click away from `#RESET`. It remains reachable, knowingly,
    through the raw-command field.
@@ -463,11 +549,14 @@ These are deliberate choices, not accidents.
   verify: route input 1 to output 4 only, then click *Refresh state*. If the mark appears on
   (out 4, in 1) the assumption holds; if it appears on (out 1, in 4), set the constant to
   `False`.
-- **`status()` on Protocol 2000 needs cross-checking** against the front-panel display, for the
-  reason given above.
+- **Switches made by other software are not announced.** The device reports front-panel presses
+  but not commands issued by another client, so those are only picked up by the periodic re-read.
 - **No TCP reconnection.** There is currently no socket-drop detection: if the matrix is powered
-  off, the GUI still believes it is connected.
-- **No versioned test suite.** Testing so far has been done with ad-hoc scripts and `--dry-run`.
+  off, the GUI still believes it is connected. Auto-refresh does turn itself off on the first
+  error, which surfaces the problem, but the connection indicator stays green.
+- **The protocol layer has no unit tests yet.** The GUI and the state tracking are covered by
+  `tests/`; frame generation and the parsing helpers are currently only exercised through
+  `--dry-run` and against hardware.
 - **EDID commands are not implemented** (deliberately — see above).
 
 ## Roadmap
@@ -480,10 +569,11 @@ These are deliberate choices, not accidents.
 - **Web GUI** on top of that API, so the matrix can be controlled from a phone or tablet without
   installing anything.
 - **TCP robustness**: keepalive, timeout, automatic return to a disconnected state.
-- **Test suite**: pure unit tests on `parse_raw`, `parse_vid_reply` and `hexdump`, plus
-  Protocol 2000 frame generation compared against the verified byte sequences above.
-- **Passive state listener**, keeping the UI in sync with front-panel button presses without
-  polling.
+- **Protocol unit tests**: `parse_raw`, `parse_vid_reply`, `hexdump`, and Protocol 2000 frame
+  generation compared against the verified byte sequences above. The GUI side already has
+  coverage in [`tests/`](tests/).
+- **Reconnection after a socket drop**, which would also restore passive listening automatically
+  instead of leaving it disabled until the user reconnects.
 - **Preset contents in the UI**: store the routing snapshot locally so each preset shows what it
   actually does (`#PRST-VID?` can read it back from the device on Protocol 3000).
 
@@ -497,6 +587,16 @@ Issues and pull requests are welcome, especially:
 
 When reporting protocol behaviour, please include the output of the relevant command with `-v`
 so the raw bytes are visible.
+
+Before opening a pull request, run the offline checks — they need no hardware and exit non-zero on
+failure:
+
+```bash
+python tests/test_gui_offline.py
+```
+
+See [`tests/README.md`](tests/README.md) for the live integration test, which needs a matrix on the
+network.
 
 ## Disclaimer
 

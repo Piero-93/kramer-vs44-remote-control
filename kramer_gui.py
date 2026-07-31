@@ -25,8 +25,8 @@ Usage:
     python kramer_gui.py --host 192.168.1.50 --port 10001
     python kramer_gui.py --serial COM3
 
-The configuration (IP, port, input/output labels and preset names) is saved to
-kramer_gui_config.json next to this script.
+The configuration (IP, port, input/output labels, preset names and the
+auto-refresh settings) is saved to kramer_gui_config.json next to this script.
 """
 
 import argparse
@@ -35,6 +35,7 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
@@ -54,7 +55,23 @@ DEFAULT_CONFIG = {
     "inputs": ["IN 1", "IN 2", "IN 3", "IN 4"],
     "outputs": ["OUT 1", "OUT 2", "OUT 3", "OUT 4"],
     "presets": [f"Preset {i}" for i in range(1, 9)],
+    "autorefresh": True,
+    "autorefresh_interval": 30,
 }
+
+# Selectable periodic-refresh intervals, in seconds. The passive listener is what
+# keeps the grid current; this is only the reconciliation net for a frame that
+# never arrived, so the default is deliberately slow. A full Protocol 2000 state
+# read costs about 0.9 s of bus time.
+AUTOREFRESH_INTERVALS = (5, 10, 30, 60)
+
+# Minimum gap between two automatic reads, in seconds. Regaining focus triggers
+# one, and alt-tabbing back and forth would otherwise keep the bus busy.
+FOCUS_REFRESH_MIN_GAP = 1.5
+
+# Protocol 2000 instruction 1, SWITCH VIDEO. The only unsolicited frame observed
+# from a VS-44HN, sent when a front-panel button is pressed.
+P2000_SWITCH_VIDEO = 1
 
 
 def load_config():
@@ -69,6 +86,9 @@ def load_config():
         vals = list(cfg.get(key) or [])[:n]
         vals += DEFAULT_CONFIG[key][len(vals):n]
         cfg[key] = vals
+    cfg["autorefresh"] = bool(cfg.get("autorefresh"))
+    if cfg.get("autorefresh_interval") not in AUTOREFRESH_INTERVALS:
+        cfg["autorefresh_interval"] = DEFAULT_CONFIG["autorefresh_interval"]
     return cfg
 
 
@@ -87,10 +107,20 @@ def save_config(cfg):
 class _LogMixin:
     """Intercepts send/recv to show the bytes in the log panel."""
 
+    _muted = False
+
     def attach_log(self, log_fn):
         self._log_fn = log_fn
 
+    def set_muted(self, muted):
+        """Silence the byte log. Used around automatic refreshes, whose traffic
+        would otherwise bury everything the user actually asked for. Safe
+        because all I/O runs on the single worker thread."""
+        self._muted = muted
+
     def _emit(self, text):
+        if self._muted:
+            return
         fn = getattr(self, "_log_fn", None)
         if fn:
             fn(text)
@@ -99,8 +129,8 @@ class _LogMixin:
         self._emit(f"TX -> {kv.hexdump(data)}   {kv.printable(data)}")
         super().send(data)
 
-    def recv(self, timeout=1.0, maxlen=512):
-        data = super().recv(timeout, maxlen)
+    def recv(self, timeout=1.0, maxlen=512, expect=None):
+        data = super().recv(timeout, maxlen, expect)
         if data:
             self._emit(f"RX <- {kv.hexdump(data)}   {kv.printable(data)}")
         return data
@@ -119,9 +149,14 @@ class LoggingSerial(_LogMixin, kv.SerialTransport):
 # --------------------------------------------------------------------------- #
 
 class Worker(threading.Thread):
-    """Runs the jobs in sequence. The protocol's 200 ms rate limit is
-    guaranteed by the Transport, which makes a single thread a requirement
-    too: two concurrent threads would violate the timing."""
+    """Runs the jobs in sequence, and listens passively while idle.
+
+    The protocol's 200 ms rate limit is guaranteed by the Transport, which makes
+    a single thread a requirement rather than a preference: two concurrent
+    threads would violate the timing. The passive listener therefore lives in
+    this same loop instead of in a thread of its own."""
+
+    IDLE_POLL = 0.2                     # seconds spent listening between jobs
 
     def __init__(self, results):
         super().__init__(daemon=True)
@@ -129,6 +164,19 @@ class Worker(threading.Thread):
         self.results = results
         self.transport = None
         self.proto = None
+        self._listen_broken = False
+
+    def attach(self, transport, proto, on_notify):
+        """Called by the connect job once the link is up."""
+        self.transport = transport
+        self.proto = proto
+        proto.on_notify = on_notify
+        self._listen_broken = False
+
+    def detach(self):
+        self.transport = None
+        self.proto = None
+        self._listen_broken = False
 
     def submit(self, tag, fn):
         self.jobs.put((tag, fn))
@@ -138,7 +186,11 @@ class Worker(threading.Thread):
 
     def run(self):
         while True:
-            item = self.jobs.get()
+            try:
+                item = self.jobs.get(timeout=self.IDLE_POLL)
+            except queue.Empty:
+                self._listen()
+                continue
             if item is None:
                 break
             tag, fn = item
@@ -146,6 +198,19 @@ class Worker(threading.Thread):
                 self.results.put((tag, fn(self), None))
             except Exception as e:
                 self.results.put((tag, None, e))
+
+    def _listen(self):
+        """Read what the device transmits by itself. A VS-44HN sends a SWITCH
+        VIDEO frame when a front-panel button is pressed, which is what keeps
+        the grid in sync without polling."""
+        if self._listen_broken or not (self.transport and self.proto):
+            return
+        try:
+            self.proto.poll_notifications(self.IDLE_POLL)
+        except Exception as e:
+            # Reported once: repeating it every 200 ms would bury the log.
+            self._listen_broken = True
+            self.results.put(("listen", None, e))
 
 
 # --------------------------------------------------------------------------- #
@@ -191,6 +256,10 @@ class App:
         self.worker = Worker(self.results)
         self.worker.start()
         self.connected = False
+        self._autorefresh_job = None
+        self._had_focus = False
+        self._last_auto = 0.0
+        self._auto_pending = False
 
         root.title("Kramer VS-44HN — matrix control")
         root.minsize(720, 640)
@@ -294,7 +363,20 @@ class App:
         self.refresh_btn = ttk.Button(bar, text="Refresh state", command=self._refresh)
         self.refresh_btn.pack(side="left", padx=(16, 0))
 
-        ttk.Label(f, text="The labels are editable and are saved when the window closes.",
+        self.autorefresh = tk.BooleanVar(value=self.cfg["autorefresh"])
+        ttk.Checkbutton(bar, text="Auto", variable=self.autorefresh,
+                        command=self._schedule_autorefresh).pack(side="left", padx=(12, 2))
+        self.autorefresh_secs = tk.StringVar(value=str(self.cfg["autorefresh_interval"]))
+        secs_box = ttk.Combobox(bar, textvariable=self.autorefresh_secs, width=3,
+                                state="readonly",
+                                values=[str(s) for s in AUTOREFRESH_INTERVALS])
+        secs_box.pack(side="left")
+        secs_box.bind("<<ComboboxSelected>>", lambda _e: self._schedule_autorefresh())
+        ttk.Label(bar, text="s").pack(side="left", padx=(2, 0))
+
+        ttk.Label(f, text="The labels are editable and are saved when the window closes. "
+                          "Front-panel switches show up on their own; Auto adds a periodic "
+                          "re-read as a safety net while the window is visible.",
                   foreground="#666").grid(row=row + 1, column=0,
                                           columnspan=self.N_IO + 2,
                                           sticky="w", pady=(6, 0))
@@ -391,14 +473,29 @@ class App:
             except queue.Empty:
                 break
             self._handle(tag, res, err)
+        # Rising edge of the window focus. Deliberately polled here instead of
+        # bound to <FocusIn>: that event bubbles up from the child widgets, so
+        # moving between the entry fields would fire it over and over.
+        focus = self._has_focus()
+        if focus and not self._had_focus:
+            self._on_focus_gained()
+        self._had_focus = focus
         self.root.after(80, self._drain)
 
     def _handle(self, tag, res, err):
+        if tag == "status_auto":
+            self._auto_pending = False
         if err:
             self._write_log(f"!! {tag}: {err}")
             if tag == "connect":
                 self._mark_disconnected()
                 messagebox.showerror("Connection failed", str(err))
+            elif tag == "status_auto":
+                # One failure is enough: the link is broken, and retrying every
+                # few seconds would only fill the log with the same error.
+                self.autorefresh.set(False)
+                self._schedule_autorefresh()
+                self._write_log("   auto-refresh turned off after the error above")
             return
         if tag == "connect":
             self.connected = True
@@ -407,10 +504,15 @@ class App:
             self._set_enabled(True)
             self._write_log(f"== connected, {res}")
             self._refresh()
+            self._schedule_autorefresh()
         elif tag == "disconnect":
             self._mark_disconnected()
         elif tag == "status":
             self._apply_status(res)
+        elif tag == "status_auto":
+            self._apply_status(res, quiet=True)
+        elif tag == "notify":
+            self._apply_notifications(res)
         elif tag == "info":
             for k, v in (res or {}).items():
                 self._write_log(f"   {k}: {v}")
@@ -423,17 +525,94 @@ class App:
         self.status.configure(text="● not connected", foreground="#a33")
         self.connect_btn.configure(text="Connect")
         self._set_enabled(False)
+        self._auto_pending = False
+        self._schedule_autorefresh()            # cancels the pending tick
         for v in self.route_vars.values():
             v.set(-1)
 
-    def _apply_status(self, mapping):
+    def _apply_status(self, mapping, quiet=False):
+        """quiet=True is the automatic refresh: only differences are logged, so
+        the panel shows front-panel presses instead of a wall of identical
+        state dumps."""
         if not mapping:
-            self._write_log("   state not interpretable, grid left unchanged")
+            if not quiet:
+                self._write_log("   state not interpretable, grid left unchanged")
             return
+        changed = {o: i for o, i in mapping.items()
+                   if o in self.route_vars and i is not None
+                   and self.route_vars[o].get() != i}
         for out, inp in mapping.items():
             if out in self.route_vars and inp is not None:
                 self.route_vars[out].set(inp)
-        self._write_log(f"   state: {mapping}")
+        if not quiet:
+            self._write_log(f"   state: {mapping}")
+        elif changed:
+            self._write_log(f"   changed on the device: {changed}")
+
+    def _apply_notifications(self, frames):
+        """Frames the device transmitted on its own, typically a front-panel
+        press. Only SWITCH VIDEO carries routing information; anything else is
+        logged and ignored rather than guessed at."""
+        routed = {}
+        for f in frames or ():
+            if f["instr"] == P2000_SWITCH_VIDEO and f["from_device"]:
+                routed[f["output"]] = f["input"]
+            else:
+                self._write_log(f"   unsolicited frame ignored: {f['raw']}")
+        if routed:
+            self._apply_status(routed, quiet=True)
+
+    # ----- automatic refresh ---------------------------------------------- #
+
+    def _is_visible(self):
+        """True unless the window is minimised or withdrawn. This gates the
+        periodic refresh: a control panel parked on a side monitor is visible
+        without holding the focus, and it still has to be in sync. On Windows a
+        maximised window reports "zoomed", not "normal"."""
+        try:
+            return self.root.state() in ("normal", "zoomed")
+        except tk.TclError:
+            return False
+
+    def _has_focus(self):
+        """True when this application owns the keyboard focus. Only used to
+        detect the moment the window comes back to the foreground."""
+        try:
+            return self.root.focus_displayof() is not None
+        except (tk.TclError, KeyError):
+            return False
+
+    def _schedule_autorefresh(self):
+        """Cancels the pending tick and re-arms it. Called on connect, on
+        disconnect, when the checkbox or the interval change, and after every
+        tick, so there is never more than one timer alive."""
+        if self._autorefresh_job is not None:
+            self.root.after_cancel(self._autorefresh_job)
+            self._autorefresh_job = None
+        if not (self.autorefresh.get() and self.connected):
+            return
+        try:
+            secs = int(self.autorefresh_secs.get())
+        except ValueError:
+            secs = DEFAULT_CONFIG["autorefresh_interval"]
+        self._autorefresh_job = self.root.after(secs * 1000, self._autorefresh_tick)
+
+    def _autorefresh_tick(self):
+        self._autorefresh_job = None
+        if self.autorefresh.get() and self.connected and self._is_visible():
+            self._refresh(quiet=True)
+        self._schedule_autorefresh()
+
+    def _on_focus_gained(self):
+        """Read the state once when the window returns to the foreground, so it
+        is already correct the moment you look at it instead of within the
+        polling interval."""
+        if not (self.autorefresh.get() and self.connected):
+            return
+        if time.monotonic() - self._last_auto < FOCUS_REFRESH_MIN_GAP:
+            return
+        self._refresh(quiet=True)
+        self._schedule_autorefresh()        # push the next tick a full interval away
 
     # ----- actions -------------------------------------------------------- #
 
@@ -442,7 +621,7 @@ class App:
             def job(w):
                 if w.transport:
                     w.transport.close()
-                w.transport = w.proto = None
+                w.detach()
                 return "closed"
             self.worker.submit("disconnect", job)
             return
@@ -462,20 +641,22 @@ class App:
             else:
                 t = LoggingSerial(dev, kv.BAUD)
             t.attach_log(self._logline)
-            w.transport = t
             if proto_choice == "p2000":
-                w.proto = kv.Protocol2000(t)
+                proto = kv.Protocol2000(t)
             elif proto_choice == "p3000":
-                w.proto = kv.Protocol3000(t)
+                proto = kv.Protocol3000(t)
             else:
-                w.proto, _ = kv.detect_protocol(t)
-                if w.proto is None:
+                proto, _ = kv.detect_protocol(t)
+                if proto is None:
                     t.close()
-                    w.transport = None
                     raise RuntimeError(
                         "No valid reply. Check the IP/port (5000, 10001 or 50000) "
                         "and that the device is powered on.")
-            return f"{t} — {w.proto.name}"
+            # The callback runs on the worker thread, so it only queues a result:
+            # touching Tk from here would be a crash waiting to happen.
+            w.attach(t, proto,
+                     lambda frames: self.results.put(("notify", frames, None)))
+            return f"{t} — {proto.name}"
 
         self.status.configure(text="● connecting…", foreground="#a70")
         self.worker.submit("connect", job)
@@ -491,18 +672,33 @@ class App:
             for v in self.route_vars.values():
                 v.set(inp)
 
-    def _refresh(self):
+    def _refresh(self, quiet=False):
         if not self.connected:
+            return
+        # A full Protocol 2000 read is one command per output and takes seconds.
+        # Without this guard a short interval would queue a new read before the
+        # previous one returned, and the job queue would grow without bound.
+        if quiet and self._auto_pending:
             return
 
         def job(w):
-            res = w.proto.status()
+            if quiet:
+                w.transport.set_muted(True)
+            try:
+                res = w.proto.status()
+            finally:
+                if quiet:
+                    w.transport.set_muted(False)
             if isinstance(res, dict):
                 return res                      # Protocol 2000
             return parse_vid_reply(res)         # Protocol 3000, best-effort
 
-        self._write_log("-> refreshing state")
-        self.worker.submit("status", job)
+        if quiet:
+            self._last_auto = time.monotonic()
+            self._auto_pending = True
+        else:
+            self._write_log("-> refreshing state")
+        self.worker.submit("status_auto" if quiet else "status", job)
 
     def _preset_recall(self, n):
         if not self.connected:
@@ -579,6 +775,10 @@ class App:
             "inputs": [v.get() for v in self.in_labels],
             "outputs": [v.get() for v in self.out_labels],
             "presets": [v.get() for v in self.preset_labels],
+            "autorefresh": self.autorefresh.get(),
+            "autorefresh_interval": (int(self.autorefresh_secs.get())
+                                     if self.autorefresh_secs.get().isdigit()
+                                     else DEFAULT_CONFIG["autorefresh_interval"]),
         })
         save_config(self.cfg)
         if self.connected:

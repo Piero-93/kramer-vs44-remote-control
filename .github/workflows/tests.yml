@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Tkinter is not part of Python on Debian, and the GUI test needs a display.
       # The runner's own python3 is used on purpose rather than actions/setup-python:

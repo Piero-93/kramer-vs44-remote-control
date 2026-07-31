@@ -30,6 +30,12 @@ On Windows and macOS Tkinter runs natively. On a headless Linux machine, use a v
 xvfb-run -a python3 tests/test_gui_offline.py
 ```
 
+One thing to know before adding window-state checks there: **a bare X server has no window
+manager**, so `iconify()` does nothing — it is a request to a window manager that is not running,
+and the window stays mapped. `withdraw()` unmaps directly and behaves the same everywhere, which is
+why the real-window check uses it. Whether Tk reports `iconic` after a minimise is Tk's business and
+the desktop's, not this project's, so the state-to-visible mapping is checked on its own instead.
+
 ## The live tests and your video
 
 Both live scripts are **read-only by default**: they only query state. To also verify a switch end

@@ -129,15 +129,48 @@ app.autorefresh.set(False)
 app._schedule_autorefresh()
 check("timer cancelled when unticked", app._autorefresh_job, None)
 
-# --- the visibility gate reads the real window state ----------------------- #
+# --- the visibility gate, against the real window -------------------------- #
+# withdraw() unmaps the window directly, so it behaves the same with or without a
+# window manager. iconify() is deliberately not used here: it is a *request* to
+# the window manager, and under a bare X server there is none, so the window
+# stays mapped and the check would pass or fail depending on the desktop.
 root.update()
 check("a mapped window counts as visible", app._is_visible(), True)
-root.iconify()
+root.withdraw()
 root.update()
-check("a minimised window does not", app._is_visible(), False)
+check("a withdrawn window does not", app._is_visible(), False)
 root.deiconify()
 root.update()
 check("visible again after restoring", app._is_visible(), True)
+
+
+# --- and the state mapping itself, which is the part we wrote --------------- #
+# Whether Tk reports "iconic" after a minimise is Tk's business and the window
+# manager's. Ours is only which states count as visible, so that is checked
+# directly instead of through a window we cannot reliably put into those states.
+class FakeRoot:
+    def __init__(self, value):
+        self.value = value
+
+    def state(self):
+        if isinstance(self.value, Exception):
+            raise self.value
+        return self.value
+
+
+class RootHolder:
+    def __init__(self, value):
+        self.root = FakeRoot(value)
+
+
+for tk_state, expected in (("normal", True), ("zoomed", True),
+                           ("iconic", False), ("withdrawn", False),
+                           ("icon", False)):
+    check(f"Tk state {tk_state!r} means visible={expected}",
+          g.App._is_visible(RootHolder(tk_state)), expected)
+check("a destroyed window is not visible",
+      g.App._is_visible(RootHolder(tk.TclError("application has been destroyed"))),
+      False)
 
 # --- a tick while minimised must not submit any job ------------------------ #
 app.autorefresh.set(True)

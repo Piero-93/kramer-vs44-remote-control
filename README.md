@@ -7,6 +7,7 @@ The VS-44HN has **no web interface**: the only way to drive it remotely is to sp
 wire protocols. This project implements both of them — the binary **Protocol 2000** (the
 factory default) and the ASCII **Protocol 3000** — so you never have to reach the front panel.
 
+[![tests](https://github.com/Piero-93/kramer-vs44-remote-control/actions/workflows/tests.yml/badge.svg)](https://github.com/Piero-93/kramer-vs44-remote-control/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License](https://img.shields.io/badge/license-GPLv3-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
@@ -36,6 +37,7 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 - [Known limitations](#known-limitations)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
+- [Disclaimer](#disclaimer)
 - [License](#license)
 
 ---
@@ -799,15 +801,17 @@ Issues and pull requests are welcome, especially:
 When reporting protocol behaviour, please include the output of the relevant command with `-v`
 so the raw bytes are visible.
 
-Before opening a pull request, run the offline checks — they need no hardware and exit non-zero on
-failure:
+The three offline suites run in CI on every push and pull request, so a broken change shows up
+without anyone remembering to look. Running them locally first is still faster:
 
 ```bash
+python tests/test_protocol_offline.py
+python tests/test_server_offline.py
 python tests/test_gui_offline.py
 ```
 
-See [`tests/README.md`](tests/README.md) for the live integration test, which needs a matrix on the
-network.
+See [`tests/README.md`](tests/README.md) for the live integration tests, which need a matrix on the
+network and are therefore not part of CI.
 
 ## Disclaimer
 

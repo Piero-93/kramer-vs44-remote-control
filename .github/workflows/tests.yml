@@ -1,0 +1,45 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+# A second push to the same branch makes the first run irrelevant.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    name: offline suites
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tkinter is not part of Python on Debian, and the GUI test needs a display.
+      # The runner's own python3 is used on purpose rather than actions/setup-python:
+      # python3-tk then installs Tkinter for exactly the interpreter that will run
+      # the tests, instead of for a different one.
+      - name: Install Tkinter and a virtual display
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-tk xvfb
+
+      - name: Interpreter in use
+        run: python3 -VV
+
+      # The project has no third-party dependencies, so there is nothing to install
+      # and no lock file to honour. pyserial is only needed for RS-232, which none
+      # of these tests touch.
+      - name: Protocol and transport
+        run: python3 tests/test_protocol_offline.py
+
+      - name: Web service
+        run: python3 tests/test_server_offline.py
+
+      - name: GUI
+        run: xvfb-run -a python3 tests/test_gui_offline.py
+
+      # The live suites are deliberately absent: they need a matrix on the network,
+      # which a CI runner does not have. See tests/README.md.

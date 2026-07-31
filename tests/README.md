@@ -21,7 +21,8 @@ python tests/test_server_live.py --matrix 192.168.1.39
 ```
 
 All of them exit non-zero if any check fails, so any can gate a pull request. The three `*_offline`
-scripts belong in CI; the live ones need a matrix on the network.
+scripts run in CI on every push and pull request — see `.github/workflows/tests.yml`. The live ones
+need a matrix on the network and are deliberately left out of it.
 
 On Windows and macOS Tkinter runs natively. On a headless Linux machine, use a virtual display:
 

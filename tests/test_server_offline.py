@@ -140,8 +140,14 @@ status, ctype, body = raw_body("/")
 check("GET / serves the page", status, 200)
 check("as HTML", ctype, "text/html; charset=utf-8")
 check("and it is the real page", b"<title>Kramer VS-44HN</title>" in body, True)
-check("with no external request in it",
-      b"http://" not in body.replace(b"http://127.0.0.1", b""), True)
+
+# The page must fetch nothing from anywhere: no CDN, no font, no analytics. The
+# XML namespace of the inline SVG icon is exempt because it is an identifier, not
+# an address - browsers never request it - and SVG will not parse without it.
+fetchable = (body.replace(b"http://127.0.0.1", b"")
+                 .replace(b"http://www.w3.org/2000/svg", b""))
+check("no external request in the page", b"http://" in fetchable, False)
+check("and none over TLS either", b"https://" in fetchable, False)
 
 # --- routing --------------------------------------------------------------- #
 status, payload = request("POST", "/api/route", {"input": 3, "output": 2})

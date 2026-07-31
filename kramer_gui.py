@@ -405,6 +405,7 @@ class App:
 
         root.title("Kramer VS-44HN — matrix control")
         root.minsize(720, 640)
+        self._set_window_icon()
 
         self._build_connection()
         self._build_routing()
@@ -413,8 +414,28 @@ class App:
         self._build_log()
 
         self._set_enabled(False)
+        # Say where the settings are, exactly as the service does. That single
+        # line is what makes portable mode discoverable: seeing a path under the
+        # user profile is what tells you that a settings file placed next to the
+        # program would be used instead.
+        self._write_log(f"settings file: {CONFIG_PATH}")
         root.after(80, self._drain)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _set_window_icon(self):
+        """Give the window an identity in the taskbar and the alt-tab list.
+
+        Also the one thing in this program that reads a bundled resource, so it
+        exercises the frozen-build resource path for real rather than leaving it
+        to be discovered later. Failure is not worth reporting: an icon is not
+        why anyone opened this."""
+        try:
+            path = kp.resource_path("packaging", "kramer.png")
+            if path.exists():
+                self._icon = tk.PhotoImage(file=str(path))
+                self.root.iconphoto(True, self._icon)
+        except tk.TclError:
+            pass
 
     # ----- widget construction -------------------------------------------- #
 

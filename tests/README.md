@@ -65,6 +65,26 @@ one for roughly ninety.
 Run the live tests **one at a time and with no other controller running**, for the same reason the
 main README gives: the matrix does not report one client's switches to another.
 
+## The desktop binary: what CI cannot check
+
+The release workflow proves the executable **builds**, that it starts and survives twenty seconds
+under a bare X server — which is where the classic one-file Tk failure shows up — and that
+`--version` exits cleanly on both platforms. On Windows that last one has to go through
+`Start-Process -Wait`, because a GUI-subsystem executable is not waited for by a shell and the exit
+code would otherwise be meaningless.
+
+Nothing automated can tell you whether it is actually usable. Once per release, on a clean Windows
+machine:
+
+- double-click it: the window opens and **no console window flashes**;
+- close it, then confirm `%APPDATA%\kramer-vs44\kramer_gui_config.json` appeared;
+- move the executable to another folder and confirm the settings came with it;
+- drop `{}` in a `kramer_gui_config.json` beside it and confirm portable mode takes over — the
+  startup log line says which file it chose;
+- check the name and icon in Task Manager and on the taskbar;
+- connect to the real matrix once, and pull its network cable to watch the amber reconnect in the
+  packaged build rather than only in a checkout.
+
 ## Why these exist
 
 They are not box-ticking. Between them they caught two real defects that reading the code did not

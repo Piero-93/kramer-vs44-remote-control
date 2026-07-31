@@ -16,3 +16,9 @@ Dockerfile     text eol=lf
 *.yml          text eol=lf
 *.yaml         text eol=lf
 *.sh           text eol=lf
+
+# Never let line-ending normalisation near these. text=auto does detect binary
+# content and leave it alone, but relying on detection for a file that has to
+# survive byte-for-byte is a bad trade when saying so costs two lines.
+*.ico          binary
+*.png          binary

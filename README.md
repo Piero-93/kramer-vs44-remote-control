@@ -24,6 +24,7 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 
 - [Features](#features)
 - [Know this before you touch the device](#know-this-before-you-touch-the-device)
+- [Download a ready-made build](#download-a-ready-made-build)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -95,6 +96,61 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
    command set contains no network commands at all (there is no `NET-IP?`). If the address is
    unknown, the rear `RESET` button is the only path back — see
    [First-time setup](#first-time-setup).
+
+## Download a ready-made build
+
+The [Releases page](https://github.com/Piero-93/kramer-vs44-remote-control/releases) carries the
+**GUI** as a single executable for Windows and Linux, amd64. No installer, no admin rights, nothing
+to unpack: one file you can put anywhere, including a USB stick. The web service is not shipped this
+way — it goes out as a [container image](#running-it-as-a-service-with-docker) instead.
+
+**RS-232 is not available in the binary.** `pyserial` is not bundled, because it would make the
+project's only third-party dependency real for everyone in order to serve the few. Run from source
+for serial.
+
+### Windows will warn you, and here is why
+
+The executable is **not signed**, so SmartScreen shows *"Windows protected your PC"* on first run:
+**More info → Run anyway**. A code-signing certificate is a recurring cost, and only an
+expensive reputation-bearing one clears that warning quickly, so it is documented rather than solved.
+
+Antivirus false positives on one-file PyInstaller output are also common — a self-extracting stub
+wrapped around a bundled interpreter is structurally what a packer looks like. UPX compression is
+deliberately **not** used, which reduces it. A corporate antivirus may still quarantine the file,
+sometimes silently. The escape hatch always works: run from source with `python kramer_gui.py`, which
+needs nothing but Python.
+
+Verify what you downloaded against `SHA256SUMS.txt` on the release:
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\kramer-gui-v0.1.0-windows-amd64.exe
+```
+
+```bash
+sha256sum -c SHA256SUMS.txt
+```
+
+### Linux needs a recent enough glibc
+
+The Linux build is made on Ubuntu 22.04 and therefore needs **glibc 2.35 or newer** — Ubuntu 22.04+,
+Debian 12+, Fedora 36+. It will not start on Debian 11 or RHEL 8, where the symptom is
+`version 'GLIBC_2.35' not found`. PyInstaller cannot bundle glibc, so the floor is the build
+machine's; running from source has no such limit.
+
+`chmod +x` it, and note it needs a graphical session. Tk is bundled, so `python3-tk` is *not*
+required for the binary.
+
+### Where it keeps its settings
+
+Same rule as everywhere else in this project, and it is what makes the binary properly portable:
+**a settings file next to the program wins.** Drop a `kramer_gui_config.json` beside the executable —
+`{}` on its own is enough — and it will use that and never touch your user profile. Without one it
+uses `%APPDATA%\kramer-vs44\` or `~/.config/kramer-vs44/`.
+
+The window logs which file it settled on at startup, so you never have to guess. See
+[Configuration, and where it lives](#configuration-and-where-it-lives).
+
+There is no auto-update. Check the Releases page.
 
 ## Requirements
 

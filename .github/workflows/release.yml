@@ -1,0 +1,183 @@
+name: release
+
+# A version tag publishes; workflow_dispatch builds the same binaries and uploads
+# them as artefacts without creating anything. The dispatch trigger is not a
+# convenience: PyInstaller is deliberately never installed on the development
+# machine, so this workflow is the only thing that ever runs the spec file, and
+# it has to be possible to try it without burning a tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  build:
+    needs: tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artefact: windows-amd64
+            binary: kramer-gui.exe
+          # Pinned, with intent. A PyInstaller binary does not bundle glibc: it
+          # requires the build machine's version or newer. 22.04 means glibc 2.35,
+          # which covers Ubuntu 22.04+, Debian 12 and Fedora 36+, and excludes
+          # Debian 11 and RHEL 8/9. Using ubuntu-latest would silently raise that
+          # floor whenever GitHub moves the alias, so the floor is chosen here and
+          # stated in the README rather than being an accident.
+          # (Revisit when 22.04 is retired - GitHub does remove runner images.)
+          - os: ubuntu-22.04
+            artefact: linux-amd64
+            binary: kramer-gui
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: The tag must match the version in the source
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(grep -oP '^VERSION\s*=\s*"\K[^"]+' kramer_paths.py)
+          tag="${GITHUB_REF_NAME#v}"
+          echo "source says $version, tag says $tag"
+          # A pre-release tag may add a suffix: v0.1.0-rc1 against VERSION 0.1.0.
+          case "$tag" in
+            "$version"|"$version"-*) ;;
+            *) echo "::error::tag $GITHUB_REF_NAME does not match VERSION $version"
+               exit 1 ;;
+          esac
+
+      # Windows ships Tcl/Tk with Python, so nothing to install. 3.12 rather than
+      # the newest: PyInstaller support lags each new CPython by weeks, and a
+      # release build is the wrong place to find that out.
+      - name: Python (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: PyInstaller (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          python -m pip install --upgrade pip
+          # The major is pinned because that is what keeps the spec file valid;
+          # patches float. An exact pin would be better for reproducibility, but
+          # it would have to be a version chosen without being able to check that
+          # it exists, and a wrong pin fails the build for no reason at all.
+          python -m pip install "pyinstaller>=6,<7"
+
+      # On Linux Tkinter belongs to the system interpreter, exactly as tests.yml
+      # already documents. --system-site-packages is what lets a venv see it,
+      # and the venv is what sidesteps PEP 668.
+      - name: Tkinter and PyInstaller (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-tk xvfb
+          python3 -m venv --system-site-packages .buildenv
+          .buildenv/bin/python -m pip install --upgrade pip
+          .buildenv/bin/python -m pip install "pyinstaller>=6,<7"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller --clean --noconfirm packaging/kramer-gui.spec
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: .buildenv/bin/pyinstaller --clean --noconfirm packaging/kramer-gui.spec
+
+      # ---- smoke tests: what a CI runner can honestly check about a GUI ------
+      - name: It starts and stays up (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x "dist/${{ matrix.binary }}"
+          # The classic one-file Tk failure - "Can't find a usable init.tcl" -
+          # happens at startup and nowhere else, so surviving 20 seconds under a
+          # bare X server is the single most valuable thing checkable here.
+          # timeout exits 124 when it had to kill a still-running process.
+          set +e
+          timeout 20 xvfb-run -a "dist/${{ matrix.binary }}"
+          code=$?
+          set -e
+          echo "exit code $code (124 means it was still running, which is the pass)"
+          [ "$code" = "124" ]
+
+      - name: It answers --version (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          out=$(xvfb-run -a "dist/${{ matrix.binary }}" --version)
+          echo "$out"
+          echo "$out" | grep -q "kramer-vs44"
+
+      - name: It answers --version (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # A GUI-subsystem executable is not waited for when started from a
+          # shell, so $LASTEXITCODE would be meaningless. Start-Process -Wait is.
+          # This also exercises the devnull redirect that keeps argparse alive
+          # when there is no console to write to - without it, --version on a
+          # windowed build dies with an AttributeError and shows nothing.
+          $p = Start-Process ".\dist\${{ matrix.binary }}" -ArgumentList '--version' -Wait -PassThru
+          "exit code $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit 1 }
+
+      - name: Name it after the tag
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          [ "${{ github.event_name }}" = "workflow_dispatch" ] && version="dev"
+          mkdir -p out
+          ext=""
+          case "${{ matrix.binary }}" in *.exe) ext=".exe" ;; esac
+          cp "dist/${{ matrix.binary }}" \
+             "out/kramer-gui-${version}-${{ matrix.artefact }}${ext}"
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kramer-gui-${{ matrix.artefact }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # to create the release
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Collect and checksum
+        run: |
+          mkdir -p out
+          find downloaded -type f -exec cp {} out/ \;
+          cd out
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # gh is preinstalled on the runner, so this needs no third-party action on
+      # the one job that holds contents: write.
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A hyphen in the tag means a pre-release: v0.1.0-rc1 is not v0.1.0.
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          # Draft, so the notes can be read before anyone can download the files.
+          gh release create "$GITHUB_REF_NAME" \
+            --draft $prerelease \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            out/*

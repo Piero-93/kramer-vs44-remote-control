@@ -30,6 +30,7 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 - [Command-line usage](#command-line-usage)
 - [GUI](#gui)
 - [Web service and browser UI](#web-service-and-browser-ui)
+- [Running it as a service with Docker](#running-it-as-a-service-with-docker)
 - [First-time setup](#first-time-setup)
 - [Protocol reference](#protocol-reference)
 - [Troubleshooting](#troubleshooting)
@@ -61,7 +62,8 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 - **GUI**: routing grid, named presets, editable input/output labels, live TX/RX byte log.
 - **Web service**: an HTTP API and a browser UI, so the matrix can be driven from a phone with
   nothing installed on it. Front-panel presses are pushed to the page over Server-Sent Events, and
-  the connection to the matrix is re-established by itself if it drops.
+  the connection to the matrix is re-established by itself if it drops. Ships as a **container
+  image** for installing as a service, configured entirely through environment variables.
 - **No dependencies at all** for TCP, GUI and web use — Tkinter and `http.server` ship with Python,
   and the browser UI is one self-contained HTML file with no framework and no build step.
   `pyserial` is needed only for RS-232.
@@ -448,10 +450,62 @@ These are choices, not oversights:
   touching the routes.
 - **Do not expose this to the internet.** There is no TLS and no rate limiting. If you need access
   from outside, put it behind a VPN.
-- **Started by hand.** Run it from a terminal, watch the log, stop it with Ctrl-C.
+- **Run it from a terminal to try it**, or as a container to keep it — see
+  [Running it as a service with Docker](#running-it-as-a-service-with-docker).
 - **Front-panel lock, EDID and raw commands are not exposed.** `#FACTORY` deliberately has no
   endpoint at all, for the same reason it is not a button in the GUI.
 - **Overwriting presets is off unless you ask for it** — see below.
+
+### Running it as a service with Docker
+
+The image contains the API, the page and nothing else — no GUI, no Tkinter, no `pyserial`, no tests,
+and **no settings file**, which matters more than it sounds: a settings file inside the image would
+sit next to the program and therefore win over the mounted volume.
+
+```bash
+docker run -d --name kramer-vs44 -p 8000:8000 \
+  -e KRAMER_MATRIX=192.168.1.39 \
+  -v /somewhere/kramer-config:/config \
+  ghcr.io/piero-93/kramer-vs44-remote-control:latest
+```
+
+For anything you intend to keep, use [`docker-compose.yml`](docker-compose.yml). It is written to be
+pasted straight into TrueNAS Scale — *Apps → Discover Apps → Custom App → Install via YAML* — and
+two things in it need changing: the volume path and `KRAMER_MATRIX`. Pin a version tag rather than
+`:latest` once it is doing something you rely on.
+
+Everything is configured through the environment variables in the
+[options table](#options), which is why they exist: a form field is easier to edit than a command
+line, and harder to get wrong.
+
+**The one thing that will go wrong on a first run** is ownership of the config directory. Docker
+creates a missing host directory owned by `root`, and the container does not run as root — so
+renaming an input fails while everything else works, which is confusing precisely because it
+half-works. Create the directory and give it to the same uid as the `user:` line in the compose file
+(`568:568` is the TrueNAS *apps* user):
+
+```bash
+mkdir -p /mnt/<pool>/apps/kramer-vs44/config
+chown -R 568:568 /mnt/<pool>/apps/kramer-vs44/config
+```
+
+If you already have names you like, copy your existing `kramer_gui_config.json` in there and they
+come with you. If the directory is not writable the service says so at startup and again in the
+browser, and nothing else degrades — see
+[Configuration, and where it lives](#configuration-and-where-it-lives).
+
+Three notes worth having before you need them:
+
+- **The healthcheck reports on the service, not on the matrix.** A switched-off matrix leaves the
+  container healthy, which is correct: the service is working, the hardware is not. Note also that
+  plain Docker and Compose do not restart an unhealthy container — the status is an indicator, not a
+  trigger.
+- **Set `TZ`.** The log prints local time, so a container without it timestamps everything in UTC and
+  every line is offset from the host's own logs.
+- **`restart: unless-stopped` makes this a 24/7 controller**, which turns *one controller at a time*
+  from advice into an operational fact. While the container is running, the Tkinter GUI is the
+  fallback for when it is stopped — not a second window. See
+  [Run one controller at a time](#️-run-one-controller-at-a-time).
 
 ### Presets, and overwriting them
 

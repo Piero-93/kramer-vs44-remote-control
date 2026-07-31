@@ -1,0 +1,76 @@
+# kramer-vs44-remote-control as a service.
+#
+# On TrueNAS Scale: Apps -> Discover Apps -> Custom App -> Install via YAML, and
+# paste this. Elsewhere: docker compose up -d.
+#
+# Two things to change before it works: the volume path, and KRAMER_MATRIX.
+#
+# There is deliberately no top-level "version:" key - it has been obsolete for
+# years and only produces a warning.
+
+services:
+  kramer-vs44:
+    # Pin a version tag for anything you rely on; :latest is for trying it out.
+    image: ghcr.io/piero-93/kramer-vs44-remote-control:latest
+    container_name: kramer-vs44
+
+    # unless-stopped rather than always: a container you deliberately stopped
+    # stays stopped across a reboot, which is what you want while diagnosing.
+    restart: unless-stopped
+
+    # This must match the owner of the config directory below. 568:568 is the
+    # TrueNAS "apps" user; on plain Docker use your own uid:gid. The image needs
+    # no ownership of anything else, so overriding the uid here is cheaper and
+    # more honest than guessing it at build time.
+    #
+    # The near-certain first-run failure is this: if the host directory does not
+    # exist, Docker creates it owned by root, and then names cannot be saved.
+    # Create it and chown it first. Everything else works either way - only
+    # renaming fails, and it says so.
+    user: "568:568"
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      # The matrix. Add :10001 or :50000 if it is not on the default port 5000.
+      KRAMER_MATRIX: "192.168.1.39"
+
+      # The log prints local time, so without TZ every line is UTC and offset
+      # from the host's own logs.
+      TZ: "Europe/Rome"
+
+      # Require a token on every request. Anyone who can reach the port can
+      # switch your monitors otherwise. Note it is visible here, in the TrueNAS
+      # UI and in docker inspect: that is unavoidable for an environment
+      # variable, so do not reuse a password you care about.
+      # KRAMER_TOKEN: "something-long-and-uninteresting"
+
+      # Only on the day you set your presets up. It is the single destructive
+      # operation this service exposes, which is why it is off by default.
+      # KRAMER_ALLOW_PRESET_STORE: "1"
+
+      # Leave KRAMER_HOST alone in a container: it is this service's listen
+      # address, exposure is decided by "ports" above, and the healthcheck
+      # probes 127.0.0.1 - so narrowing it would only paint the app red.
+      # KRAMER_PORT changes both the listen port and the healthcheck.
+
+    volumes:
+      # Input, output and preset names live here, and this is the only thing the
+      # service writes. Without the volume it still runs, but the names go back
+      # to IN 1 / OUT 1 on every redeploy.
+      - /mnt/<pool>/apps/kramer-vs44/config:/config
+
+    # A matrix that is switched off still produces log lines. Keep them bounded.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Optional hardening. None of it is required, and none of it is enabled by
+    # default because a NAS owner should be able to docker exec into this.
+    # read_only: true
+    # tmpfs: ["/tmp"]
+    # cap_drop: ["ALL"]
+    # security_opt: ["no-new-privileges:true"]

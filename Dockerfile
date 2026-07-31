@@ -14,10 +14,17 @@
 
 # slim rather than alpine, for a reason specific to this project. With no
 # third-party packages there are no wheels to build, which removes the usual
-# argument *for* alpine and leaves only the cost of a different C library. slim
-# also ships without Tkinter, which turns "the service must not import the GUI"
-# from a convention into something the image enforces. The minor version is
-# pinned and the patch floats, so a rebuild picks up security updates.
+# argument *for* alpine and leaves only the cost of a different C library. The
+# minor version is pinned and the patch floats, so a rebuild picks up security
+# updates.
+#
+# slim also cannot run Tkinter, which turns "the service must not import the GUI"
+# from a convention into something the image enforces. To be exact, because the
+# obvious phrasing is wrong: the tkinter package and the _tkinter extension are
+# both present; what is missing is the Tcl/Tk shared libraries, so the import
+# fails with "libtk8.6.so: cannot open shared object file". That is why the CI
+# check performs a real import rather than asking importlib whether the module
+# can be found - find_spec answers yes.
 FROM python:3.12-slim
 
 LABEL org.opencontainers.image.title="kramer-vs44-remote-control" \

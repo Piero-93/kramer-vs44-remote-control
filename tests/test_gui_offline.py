@@ -15,6 +15,7 @@ Exits non-zero if any check fails, so it can gate a pull request.
 """
 
 import argparse
+import json
 import sys
 import time
 import tkinter as tk
@@ -267,7 +268,7 @@ check("the change is logged",
 app.autorefresh_secs.set("30")
 app.autorefresh.set(True)
 app._on_close()
-saved = g.json.loads(g.CONFIG_PATH.read_text(encoding="utf-8"))
+saved = json.loads(g.CONFIG_PATH.read_text(encoding="utf-8"))
 check("periodic refresh persisted", saved["autorefresh"], True)
 check("interval persisted", saved["autorefresh_interval"], 30)
 

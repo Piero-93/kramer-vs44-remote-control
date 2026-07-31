@@ -31,6 +31,9 @@ jobs:
       # The project has no third-party dependencies, so there is nothing to install
       # and no lock file to honour. pyserial is only needed for RS-232, which none
       # of these tests touch.
+      - name: Settings location and atomic writes
+        run: python3 tests/test_paths_offline.py
+
       - name: Protocol and transport
         run: python3 tests/test_protocol_offline.py
 

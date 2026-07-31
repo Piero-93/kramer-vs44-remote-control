@@ -26,27 +26,36 @@ Usage:
     python kramer_gui.py --serial COM3
 
 The configuration (IP, port, input/output labels, preset names and the
-auto-refresh settings) is saved to kramer_gui_config.json next to this script.
+auto-refresh settings) is shared with kramer_server.py. It lives next to the
+program when a file is already there, and in the per-user directory otherwise;
+--config overrides both. See kramer_paths.py.
 """
 
 import argparse
-import json
+import os
 import queue
 import re
 import sys
 import threading
 import time
 import tkinter as tk
-from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
 try:
+    import kramer_paths as kp
     import kramer_vs44 as kv
-except ImportError:
-    sys.exit("ERROR: kramer_vs44.py must be in the same directory as this file.")
+except ImportError as e:
+    # getattr rather than an import, because the module that failed to load may
+    # be the one that would have told us whether this is a frozen build.
+    if getattr(sys, "frozen", False):
+        sys.exit(f"ERROR: this build is incomplete ({e}). Please report it.")
+    sys.exit("ERROR: kramer_paths.py and kramer_vs44.py must be in the same "
+             f"directory as this file ({e}).")
 
 
-CONFIG_PATH = Path(__file__).with_name("kramer_gui_config.json")
+# Reassigned in main() once --config has been parsed. It stays a module global
+# because that is what the test suites substitute.
+CONFIG_PATH = kp.config_path()
 
 DEFAULT_CONFIG = {
     "host": "192.168.1.39",
@@ -76,11 +85,10 @@ P2000_SWITCH_VIDEO = 1
 
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
-    if CONFIG_PATH.exists():
-        try:
-            cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
-        except Exception as e:
-            print(f"Unreadable config, falling back to defaults: {e}")
+    cfg.update(kp.read_json(
+        CONFIG_PATH,
+        on_error=lambda e: print(f"Unreadable config, falling back to "
+                                 f"defaults: {e}")))
     # normalise the lengths: a hand-edited file must not break the UI
     for key, n in (("inputs", 4), ("outputs", 4), ("presets", 8)):
         vals = list(cfg.get(key) or [])[:n]
@@ -98,19 +106,18 @@ def save_config(cfg):
     kramer_server.py writes the labels to this same file, so a blind overwrite
     would silently discard keys this program does not know about. It does not
     make the two safe to run at once - for the keys they both own, the last
-    writer still wins - which is why only one controller should be running."""
+    writer still wins - which is why only one controller should be running.
+
+    Returns None on success, or the error. The caller has to show it: in a
+    windowed build there is no console for a printed message to land in, so
+    reporting the failure by printing it would mean losing the settings in
+    silence - which is the whole class of bug this is here to avoid."""
     try:
-        data = {}
-        if CONFIG_PATH.exists():
-            try:
-                data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        data.update(cfg)
-        CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                               encoding="utf-8")
-    except Exception as e:
+        kp.merge_json(CONFIG_PATH, cfg)
+    except OSError as e:
         print(f"Could not save the config: {e}")
+        return e
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -793,7 +800,12 @@ class App:
                                      if self.autorefresh_secs.get().isdigit()
                                      else DEFAULT_CONFIG["autorefresh_interval"]),
         })
-        save_config(self.cfg)
+        failure = save_config(self.cfg)
+        if failure:
+            messagebox.showerror(
+                "Settings not saved",
+                f"Your labels and preset names could not be written to\n"
+                f"{CONFIG_PATH}\n\n{failure}")
         if self.connected:
             self.worker.submit("disconnect", lambda w: (w.transport.close(), "closed")[1])
         self.worker.stop()
@@ -801,11 +813,22 @@ class App:
 
 
 def main():
+    global CONFIG_PATH
+
+    # A windowed build has no console, so CPython leaves sys.stdout and
+    # sys.stderr as None. print() tolerates that, but argparse writes to the
+    # stream object itself: --version, --help and every "invalid value" path
+    # would die with an AttributeError and show nothing at all.
+    if getattr(sys, "frozen", False) and sys.stdout is None:
+        sys.stdout = sys.stderr = open(os.devnull, "w")
+
     ap = argparse.ArgumentParser(description="GUI for Kramer VS-44HN / VS-44H matrices.")
     ap.add_argument("--host", help="matrix IP address (default 192.168.1.39)")
     ap.add_argument("--port", type=int, help="TCP port (5000, 10001 or 50000)")
     ap.add_argument("--serial", help="use the serial port, e.g. COM3")
+    kp.add_common_arguments(ap)
     args = ap.parse_args()
+    CONFIG_PATH = kp.config_path(args.config)
 
     root = tk.Tk()
     try:

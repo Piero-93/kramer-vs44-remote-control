@@ -10,6 +10,7 @@ can be exercised without hardware. Exits non-zero if any check fails.
 """
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -300,6 +301,55 @@ status, payload = request("POST", "/api/route", {"input": 1, "output": 1})
 check("a command with no token is refused too", status, 401)
 server.token = None
 
+# --- options: the environment supplies defaults, flags win ----------------- #
+# The environment is read when build_parser() runs, because that is when the
+# defaults are computed - so it has to be set before the call, not before parse.
+
+
+def parse(argv, **env):
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update({k: v for k, v in env.items()})
+    try:
+        return ks.build_parser().parse_args(argv)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+check("defaults with an empty environment", parse([]).port, 8000)
+check("an environment variable supplies the default",
+      parse([], KRAMER_PORT="9100").port, 9100)
+check("and a flag beats it",
+      parse(["--port", "9200"], KRAMER_PORT="9100").port, 9200)
+# A form field left blank in a container UI arrives as an empty string.
+check("a blank variable is not a value", parse([], KRAMER_PORT="").port, 8000)
+check("the matrix address comes from the environment too",
+      parse([], KRAMER_MATRIX="10.0.0.5:10001").matrix, "10.0.0.5:10001")
+check("so does the token", parse([], KRAMER_TOKEN="abc").token, "abc")
+check("and the heartbeat", parse([], KRAMER_HEARTBEAT="5").heartbeat, 5.0)
+check("preset storing can be enabled by the environment",
+      parse([], KRAMER_ALLOW_PRESET_STORE="1").allow_preset_store, True)
+check("but not enabled by a blank one",
+      parse([], KRAMER_ALLOW_PRESET_STORE="").allow_preset_store, False)
+# KRAMER_CONFIG is deliberately NOT an argparse default: config_path() reads it
+# itself, so the same precedence applies to every program without each of them
+# having to remember the variable. The flag stays None unless it is given.
+check("--config is not fed from the environment",
+      parse([], KRAMER_CONFIG="somewhere.json").config, None)
+check("and is what it was given", parse(["--config", "x.json"]).config, "x.json")
+
+# A bad numeric value must produce argparse's ordinary complaint and exit 2,
+# not a crash somewhere further in. This is why numeric defaults are left as
+# strings: argparse then applies its own type conversion to them.
+try:
+    parse([], KRAMER_PORT="notanumber")
+    check("a non-numeric port is rejected", "no exit", "SystemExit 2")
+except SystemExit as e:
+    check("a non-numeric port is rejected", e.code, 2)
+
 # --- the event stream ------------------------------------------------------ #
 received = queue.Queue()
 
@@ -329,6 +379,32 @@ request("PUT", "/api/labels", {"inputs": ["A", "B", "C", "D"]})
 event = received.get(timeout=5)
 check("a label change is pushed too", event["type"], "labels")
 check("with the new names", event["labels"]["inputs"], ["A", "B", "C", "D"])
+
+# --- a settings location that cannot be written ---------------------------- #
+# The container case: /config mounted read-only. Renaming must fail visibly and
+# nothing else may degrade - a rename that evaporates on restart, and that two
+# browsers disagree about, is worse than an error.
+real_save = ks.save_labels
+ks.save_labels = lambda labels: (_ for _ in ()).throw(
+    PermissionError("Read-only file system"))
+try:
+    status, payload = request("PUT", "/api/labels", {"inputs": ["X"] * 4})
+    # 500 and not 503: in this API 503 already means "the matrix is not
+    # connected", so reusing it here would make the message in the page lie.
+    check("an unwritable settings file answers 500", status, 500)
+    check("and names the path so the message is actionable",
+          str(ks.CONFIG_PATH) in payload.get("error", ""), True)
+    status, payload = request("GET", "/api/labels")
+    check("reading labels still works", status, 200)
+    check("and the previous names are intact", payload["inputs"],
+          ["A", "B", "C", "D"])
+finally:
+    ks.save_labels = real_save
+try:
+    stray = received.get(timeout=1)
+    check("a failed write publishes no event", stray, "nothing")
+except queue.Empty:
+    check("a failed write publishes no event", "nothing", "nothing")
 
 # A front-panel press reaches the browser through the same path.
 link.routing[4] = 3

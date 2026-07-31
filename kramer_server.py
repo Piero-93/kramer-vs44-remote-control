@@ -50,6 +50,7 @@ Endpoints
 
 import argparse
 import json
+import os
 import queue
 import re
 import socket
@@ -58,13 +59,17 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import kramer_paths as kp
 import kramer_vs44 as kv
 
 N_IO = 4
 N_PRESETS = 8
 
-# Shared with the Tkinter GUI on purpose, so both show the same names.
-CONFIG_PATH = Path(__file__).with_name("kramer_gui_config.json")
+# Shared with the Tkinter GUI on purpose, so both show the same names. Resolved
+# here so the module is usable without main(), and reassigned in main() once
+# --config has been parsed. It stays a module global because that is what the
+# test suites substitute.
+CONFIG_PATH = kp.config_path()
 
 # Kept in step with kramer_gui.DEFAULT_CONFIG. Duplicated rather than imported
 # because importing that module would pull in Tkinter, which a headless service
@@ -75,8 +80,7 @@ DEFAULT_LABELS = {
     "presets": [f"Preset {n}" for n in range(1, N_PRESETS + 1)],
 }
 
-WEB_ROOT = Path(__file__).with_name("web")
-INDEX = WEB_ROOT / "index.html"
+INDEX = kp.resource_path("web", "index.html")
 
 SSE_KEEPALIVE = 15.0            # seconds between SSE comment frames
 SSE_BACKLOG = 32                # events buffered per browser before dropping
@@ -91,12 +95,9 @@ def log(message):
 # --------------------------------------------------------------------------- #
 
 def load_labels():
-    data = {}
-    if CONFIG_PATH.exists():
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception as e:
-            log(f"unreadable config, using default labels: {e}")
+    data = kp.read_json(CONFIG_PATH,
+                        on_error=lambda e: log(f"unreadable config, using "
+                                               f"default labels: {e}"))
     out = {}
     for key, defaults in DEFAULT_LABELS.items():
         vals = [str(v) for v in (data.get(key) or [])][:len(defaults)]
@@ -106,18 +107,14 @@ def load_labels():
 
 
 def save_labels(labels):
-    """Read-modify-write: only the label keys are touched, everything else in
-    the file is preserved. The Tkinter GUI writes to the same file, and blindly
-    overwriting it would discard its settings."""
-    data = {}
-    if CONFIG_PATH.exists():
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            data = {}
-    data.update(labels)
-    CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                           encoding="utf-8")
+    """Only the label keys are touched: the Tkinter GUI writes to this same file
+    and owns other keys in it. The write is atomic - see kramer_paths.merge_json.
+
+    Raises OSError when the location cannot be written, which is a real
+    possibility once this runs in a container with a read-only volume. The
+    caller reports it; it must not be swallowed, because a rename that
+    evaporates on restart is worse than an error."""
+    kp.merge_json(CONFIG_PATH, labels)
 
 
 # --------------------------------------------------------------------------- #
@@ -383,6 +380,7 @@ class EventHub:
 
 PRESET_RECALL = re.compile(r"^/api/preset/(\d+)/recall$")
 PRESET_STORE = re.compile(r"^/api/preset/(\d+)/store$")
+TOKEN_IN_QUERY = re.compile(r"token=[^&\s]*")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -393,14 +391,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         # The SSE stream is one long request; logging it once is enough.
-        if self.path != "/api/events":
-            log(f"{self.address_string()} {fmt % args}")
+        if self.path == "/api/events":
+            return
+        # The request line carries the query string, so a ?token=... request
+        # would otherwise write the token into the log - and in a container
+        # those logs get collected.
+        log(f"{self.address_string()} {TOKEN_IN_QUERY.sub('token=***', fmt % args)}")
 
     def _authorized(self):
-        """Single gate for every request. There is no authentication yet, by
-        choice: the service is meant for a trusted LAN. It exists so a token or
-        a session cookie can be added here alone, without touching the routes.
-        Set "token" in the config file to require ?token=... or an
+        """Single gate for every request. There is no authentication by default,
+        by choice: the service is meant for a trusted LAN. It exists so a token
+        or a session cookie can be added here alone, without touching the routes.
+        Pass --token, or set KRAMER_TOKEN, to require ?token=... or an
         Authorization: Bearer header."""
         token = self.server.token
         if not token:
@@ -468,7 +470,18 @@ class Handler(BaseHTTPRequestHandler):
             labels = self._validated_labels(payload)
         except ValueError as e:
             return self._error(400, str(e))
-        save_labels(labels)
+        try:
+            save_labels(labels)
+        except OSError as e:
+            # 500, not 503: in this API 503 already means "the matrix is not
+            # connected", and reusing it here would make the message in the page
+            # actively misleading. A config location that cannot be written is
+            # the same class of fault as a missing index.html - installed wrong -
+            # which already answers 500. Nothing else degrades: routing, presets
+            # and the event stream never touch this file, so the result is a
+            # fully working controller that cannot rename things.
+            log(f"cannot save the names to {CONFIG_PATH}: {e}")
+            return self._error(500, f"cannot save the names: {e} ({CONFIG_PATH})")
         # Read back the complete set rather than echoing the partial update: a
         # client replaces its whole label state with what arrives here, and
         # handing it half an object would leave it with holes.
@@ -671,28 +684,55 @@ class Server(ThreadingHTTPServer):
 # Entry point
 # --------------------------------------------------------------------------- #
 
-def main():
+def build_parser():
+    """Separate from main() so the option handling can be tested without
+    starting a server.
+
+    Every option falls back to an environment variable, which makes a given flag
+    win with no precedence logic to get wrong: the environment only supplies the
+    default. Numeric defaults are left as strings on purpose, because argparse
+    applies its own `type` to a string default - so KRAMER_PORT=abc produces the
+    ordinary "invalid int value" exit rather than a crash further in."""
     ap = argparse.ArgumentParser(
         description="HTTP API and web UI for Kramer VS-44HN HDMI matrices.")
-    ap.add_argument("--matrix", default="192.168.1.39", metavar="HOST[:PORT]",
-                    help="matrix address (default 192.168.1.39, TCP port "
-                         f"{kv.DEFAULT_TCP_PORT})")
-    ap.add_argument("--machine", type=int, default=1,
-                    help="Protocol 2000 machine number (default 1)")
-    ap.add_argument("--host", default="0.0.0.0",
-                    help="address to listen on (default 0.0.0.0, the whole LAN; "
-                         "use 127.0.0.1 to keep it on this machine)")
-    ap.add_argument("--port", type=int, default=8000, help="HTTP port (default 8000)")
-    ap.add_argument("--token", help="require this token on every request "
-                                    "(Authorization: Bearer, or ?token=)")
+    ap.add_argument("--matrix", metavar="HOST[:PORT]",
+                    default=kp.env_default("KRAMER_MATRIX", "192.168.1.39"),
+                    help="matrix address (env KRAMER_MATRIX, default "
+                         f"192.168.1.39, TCP port {kv.DEFAULT_TCP_PORT})")
+    ap.add_argument("--machine", type=int,
+                    default=kp.env_default("KRAMER_MACHINE", "1"),
+                    help="Protocol 2000 machine number (env KRAMER_MACHINE, "
+                         "default 1)")
+    ap.add_argument("--host", default=kp.env_default("KRAMER_HOST", "0.0.0.0"),
+                    help="address THIS SERVICE listens on, not the matrix (env "
+                         "KRAMER_HOST, default 0.0.0.0, the whole LAN; use "
+                         "127.0.0.1 to keep it on this machine)")
+    ap.add_argument("--port", type=int, default=kp.env_default("KRAMER_PORT", "8000"),
+                    help="HTTP port for this service (env KRAMER_PORT, default 8000)")
+    ap.add_argument("--token", default=kp.env_default("KRAMER_TOKEN"),
+                    help="require this token on every request (env KRAMER_TOKEN; "
+                         "Authorization: Bearer, or ?token=)")
     ap.add_argument("--allow-preset-store", action="store_true",
+                    default=kp.env_flag("KRAMER_ALLOW_PRESET_STORE"),
                     help="allow overwriting the hardware presets; off by default "
-                         "because it is the only destructive operation here")
-    ap.add_argument("--heartbeat", type=float, default=DeviceLink.HEARTBEAT,
+                         "because it is the only destructive operation here (env "
+                         "KRAMER_ALLOW_PRESET_STORE=1). Note the flag can only "
+                         "turn this on: clear the variable to turn it off")
+    ap.add_argument("--heartbeat", type=float,
+                    default=kp.env_default("KRAMER_HEARTBEAT",
+                                           str(DeviceLink.HEARTBEAT)),
                     metavar="SECONDS",
-                    help=f"probe the matrix after this much silence (default "
-                         f"{DeviceLink.HEARTBEAT:g}; 0 disables the check)")
-    args = ap.parse_args()
+                    help=f"probe the matrix after this much silence (env "
+                         f"KRAMER_HEARTBEAT, default {DeviceLink.HEARTBEAT:g}; "
+                         f"0 disables the check)")
+    kp.add_common_arguments(ap)
+    return ap
+
+
+def main():
+    global CONFIG_PATH
+    args = build_parser().parse_args()
+    CONFIG_PATH = kp.config_path(args.config)
 
     host, _, port = args.matrix.partition(":")
     link = DeviceLink(host, int(port) if port else kv.DEFAULT_TCP_PORT,
@@ -713,7 +753,15 @@ def main():
     link.start()
 
     shown = args.host if args.host != "0.0.0.0" else _local_address()
+    log(f"kramer-vs44 {kp.VERSION}")
     log(f"serving http://{shown}:{args.port}/  (matrix {link.detail})")
+    # Naming the resolved file turns every future "where did my names go" into a
+    # line someone can read, instead of an investigation.
+    log(f"settings file: {CONFIG_PATH}")
+    if not _config_writable():
+        log(f"WARNING: {CONFIG_PATH.parent} is not writable, so names cannot be "
+            "changed from the browser. Everything else works. In a container, "
+            "check the ownership of the mounted directory")
     if not args.token:
         log("no token set: anyone on this network can switch the matrix")
     if args.allow_preset_store:
@@ -731,6 +779,20 @@ def main():
         server.server_close()
         link.stop()
     return 0
+
+
+def _config_writable():
+    """Best effort, purely so the warning can be printed at startup instead of
+    first met when someone tries to rename an input.
+
+    The authoritative answer is the write attempt itself, which is why this only
+    produces a warning and PUT /api/labels still reports its own failure: an
+    os.access check is optimistic for uid 0 and says nothing about a filesystem
+    remounted read-only later."""
+    probe = CONFIG_PATH.parent
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    return os.access(probe, os.W_OK)
 
 
 def _local_address():

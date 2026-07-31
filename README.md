@@ -338,6 +338,16 @@ It prints the URL to open. The page is `web/index.html`, one self-contained file
 no build step and no external request: commands go out with `fetch()`, state arrives over
 Server-Sent Events, and both are native browser features.
 
+The page has three parts. **Routing** is the grid, with outputs as rows and inputs as columns, the
+same convention as the Tkinter GUI. **Presets** recalls, and only recalls. **Settings** holds the two
+rare operations, each behind a disclosure that is closed on arrival: renaming inputs, outputs and
+presets, and storing the current routing into a slot.
+
+The header shows two things, and the second one matters more than it looks: whether the **matrix** is
+connected, and whether **this page is still being fed**. A control panel that has quietly stopped
+receiving updates looks exactly like one where nothing is happening, so the page says `live, last
+update just now` while the stream is healthy and turns to `not receiving updates` when it is not.
+
 ### ⚠️ Run one controller at a time
 
 **Do not run the web service and the Tkinter GUI against the matrix simultaneously.** This is not
@@ -429,9 +439,11 @@ guarded three times over, from the outside in:
    the time nothing reachable on the network can destroy them. This is the real gate — the two
    below are in the page, and a page's protections are trivially bypassed by anyone able to send a
    POST.
-2. **The buttons do not switch roles behind your back.** "Overwrite a preset…" arms a distinct
-   mode, in which the preset buttons change colour and store instead of recall. Recall never sits
-   one mis-tap away from overwrite, which matters on a phone.
+2. **Storing lives in Settings, with its own buttons.** The Presets section recalls and nothing
+   else, so the part of the page used every day is incapable of destroying anything — no mode that
+   changes what a button does, and nothing to leave armed by mistake. Opening the panel sends no
+   command; it lists the routing that would be captured, with your own names, and eight slots
+   marked with a dot where they already hold a layout.
 3. **The confirmation says what will happen**, listing the routing about to be captured with your
    own names, and stating whether the slot is empty or about to lose what it holds.
 

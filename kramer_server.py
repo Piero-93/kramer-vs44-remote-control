@@ -528,6 +528,10 @@ class Handler(BaseHTTPRequestHandler):
             pass                                # the browser went away
         finally:
             hub.unsubscribe(q)
+            # The stream is delimited by the connection closing, so there is no
+            # next request on it. Saying so keeps the server from trying to read
+            # one and printing a traceback for a socket the browser abandoned.
+            self.close_connection = True
             log(f"{self.address_string()} stopped listening "
                 f"({hub.count()} left)")
 

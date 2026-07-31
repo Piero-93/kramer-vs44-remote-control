@@ -68,10 +68,6 @@
     border-color: var(--accent); font-weight: 600;
   }
   button.arm { border-color: var(--danger); color: var(--danger); }
-  button.arm.active {
-    background: var(--danger); color: #fff; border-color: var(--danger);
-    font-weight: 600;
-  }
   .dot { color: var(--accent); font-size: .7em; vertical-align: .15em; }
   button.arm .dot { color: currentColor; }
   .hint { color: var(--muted); font-size: .85rem; }
@@ -102,6 +98,7 @@
   <header>
     <h1>Kramer VS-44HN</h1>
     <span id="link">connecting…</span>
+    <span id="live" class="hint"></span>
   </header>
 
   <section>
@@ -117,18 +114,18 @@
   <section>
     <h2>Presets</h2>
     <div id="presets"></div>
-    <div class="row" style="margin-top:.7rem">
-      <button id="arm" class="arm" hidden>Overwrite a preset…</button>
-      <span id="presetHint" class="hint"></span>
-    </div>
+    <span id="presetHint" class="hint"></span>
   </section>
 
   <section>
+    <h2>Settings</h2>
     <div class="row">
-      <button id="rename">Edit names</button>
-      <span id="renameHint" class="muted"></span>
+      <button id="toggleNames">▸ Edit names</button>
+      <button id="toggleStore" class="arm" hidden>▸ Save the current routing</button>
+      <span id="settingsHint" class="hint"></span>
     </div>
     <div id="editor" hidden></div>
+    <div id="storePanel" hidden></div>
   </section>
 
   <footer>Run one controller at a time: the matrix does not report another
@@ -146,9 +143,24 @@ const $ = (id) => document.getElementById(id);
 let state = { connected: false, routing: {}, presets: {}, detail: "", error: null };
 let labels = { inputs: [], outputs: [], presets: [] };
 let busy = false;
-// Storing overwrites a preset and is the only destructive action here, so it is
-// never one tap away from recalling: it needs this mode plus a confirmation.
-let armed = false;
+// Storing overwrites a preset, and it is the only destructive action here. It
+// therefore lives in Settings with its own buttons rather than re-purposing the
+// preset buttons: the section used every day stays incapable of destroying
+// anything, and there is no armed state to forget about.
+const panels = { names: false, store: false };
+// Transient confirmations have to survive a re-render: a store publishes a state
+// event that comes straight back, so anything written directly into the DOM
+// would be wiped a few milliseconds later.
+let notice = "";
+let streamUp = false;
+let lastEvent = 0;
+
+function say(message) {
+  notice = message;
+  renderSettings();
+  clearTimeout(say.timer);
+  say.timer = setTimeout(() => { notice = ""; renderSettings(); }, 4000);
+}
 
 /* ---------- rendering ---------------------------------------------------- */
 
@@ -160,6 +172,19 @@ function renderLink() {
   } else {
     el.textContent = state.error || "not connected to the matrix";
   }
+
+  // Whether this page is still being fed, and when it last heard anything. A
+  // control panel that has silently stopped listening looks exactly like one
+  // where nothing is happening, and that is the failure worth making visible.
+  const live = $("live");
+  if (!streamUp) {
+    live.textContent = "· not receiving updates";
+    live.className = "hint warn";
+    return;
+  }
+  const age = Math.round((Date.now() - lastEvent) / 1000);
+  live.textContent = `· live, last update ${age < 2 ? "just now" : age + "s ago"}`;
+  live.className = "hint";
 }
 
 function renderGrid() {
@@ -204,48 +229,55 @@ function cell(input, output, text) {
   return td;
 }
 
+function presetButton(n, destructive) {
+  const b = document.createElement("button");
+  b.append(destructive ? String(n) : labels.presets[n - 1]);
+  if (state.presets && state.presets[n]) {
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    dot.textContent = " ●";
+    dot.title = "holds a layout";
+    b.appendChild(dot);
+  }
+  b.disabled = busy || !state.connected;
+  if (destructive) {
+    b.classList.add("arm");
+    b.title = `Overwrite ${labels.presets[n - 1]} with the current routing`;
+    b.onclick = () => store(n);
+  } else {
+    b.title = `Recall ${labels.presets[n - 1]}`;
+    b.onclick = () => recall(n);
+  }
+  return b;
+}
+
 function renderPresets() {
   const box = $("presets");
   box.textContent = "";
-  for (let n = 1; n <= N_PRESETS; n++) {
-    const b = document.createElement("button");
-    b.append(labels.presets[n - 1]);
-    if (state.presets && state.presets[n]) {
-      const dot = document.createElement("span");
-      dot.className = "dot";
-      dot.textContent = " ●";
-      dot.title = "holds a layout";
-      b.appendChild(dot);
-    }
-    b.disabled = busy || !state.connected;
-    if (armed) {
-      b.classList.add("arm");
-      b.title = `Overwrite ${labels.presets[n - 1]} with the current routing`;
-      b.onclick = () => store(n);
-    } else {
-      b.title = `Recall ${labels.presets[n - 1]}`;
-      b.onclick = () => recall(n);
-    }
-    box.appendChild(b);
-  }
-
-  const arm = $("arm");
-  arm.hidden = !state.allow_preset_store;
-  arm.classList.toggle("active", armed);
-  arm.textContent = armed ? "Cancel" : "Overwrite a preset…";
-  arm.disabled = busy || !state.connected;
-  const hint = $("presetHint");
-  hint.className = armed ? "hint warn" : "hint";
-  if (armed) {
-    hint.textContent = "Pick a preset to overwrite with the routing shown above.";
-  } else if (state.allow_preset_store) {
-    hint.textContent = "● marks a preset that already holds a layout.";
-  } else {
-    hint.textContent = "Overwriting presets is disabled on this service.";
-  }
+  for (let n = 1; n <= N_PRESETS; n++) box.appendChild(presetButton(n, false));
+  $("presetHint").textContent = "● marks a preset that already holds a layout.";
 }
 
-function renderAll() { renderLink(); renderGrid(); renderPresets(); }
+function renderSettings() {
+  const canStore = !!state.allow_preset_store;
+  $("toggleStore").hidden = !canStore;
+  $("toggleStore").disabled = busy || !state.connected;
+  $("toggleNames").textContent = (panels.names ? "▾" : "▸") + " Edit names";
+  $("toggleStore").textContent =
+    (panels.store ? "▾" : "▸") + " Save the current routing";
+  $("editor").hidden = !panels.names;
+  $("storePanel").hidden = !panels.store;
+  $("settingsHint").textContent = notice ||
+    (canStore ? "" : "Overwriting presets is disabled on this service.");
+  if (panels.store) renderStorePanel();
+}
+
+function renderAll() {
+  renderLink();
+  renderGrid();
+  renderPresets();
+  renderSettings();
+}
 
 function toast(message) {
   const el = $("toast");
@@ -288,14 +320,41 @@ async function recall(n) {
   if (res) { state = res; renderAll(); }
 }
 
-function routingSummary() {
+function routingLines() {
   const lines = [];
   for (let o = 1; o <= N_IO; o++) {
     const i = Number(state.routing[o]);
-    lines.push(`  ${labels.outputs[o - 1]} ← ` +
+    lines.push(`${labels.outputs[o - 1]} ← ` +
                (i === 0 ? "nothing" : labels.inputs[i - 1]));
   }
-  return lines.join("\n");
+  return lines;
+}
+
+function renderStorePanel() {
+  // Rebuilt on every state change, so the layout listed here is the one that
+  // would actually be captured rather than whatever it was when opened.
+  const box = $("storePanel");
+  box.textContent = "";
+  const list = document.createElement("div");
+  list.className = "hint";
+  list.style.margin = ".6rem 0";
+  for (const line of routingLines()) {
+    const div = document.createElement("div");
+    div.textContent = line;
+    list.appendChild(div);
+  }
+  box.appendChild(list);
+
+  const label = document.createElement("div");
+  label.className = "hint warn";
+  label.textContent = "Save into — this replaces whatever the slot holds:";
+  box.appendChild(label);
+
+  const row = document.createElement("div");
+  row.className = "row";
+  row.style.marginTop = ".4rem";
+  for (let n = 1; n <= N_PRESETS; n++) row.appendChild(presetButton(n, true));
+  box.appendChild(row);
 }
 
 async function store(n) {
@@ -304,20 +363,20 @@ async function store(n) {
   const name = labels.presets[n - 1];
   const occupied = state.presets && state.presets[n];
   const message =
-    `Store the current routing into "${name}"?\n\n${routingSummary()}\n\n` +
+    `Store the current routing into "${name}"?\n\n` +
+    routingLines().map((l) => "  " + l).join("\n") + "\n\n" +
     (occupied ? `"${name}" already holds a layout and it will be lost.`
               : `"${name}" is currently empty.`);
   if (!confirm(message)) return;
   const res = await send("POST", `/api/preset/${n}/store`);
   if (res) {
     state = res;
-    armed = false;
     renderAll();
-    $("presetHint").textContent = `Saved into "${name}".`;
+    say(`Saved into "${name}".`);
   }
 }
 
-$("arm").onclick = () => { armed = !armed; renderPresets(); };
+$("toggleStore").onclick = () => { panels.store = !panels.store; renderSettings(); };
 
 /* ---------- editing the names ------------------------------------------- */
 
@@ -367,19 +426,16 @@ async function saveNames() {
   const res = await send("PUT", "/api/labels", payload);
   if (res) {
     labels = res;
+    panels.names = false;
     renderAll();
-    $("editor").hidden = true;
-    $("rename").textContent = "Edit names";
-    $("renameHint").textContent = "saved";
-    setTimeout(() => { $("renameHint").textContent = ""; }, 3000);
+    say("Names saved.");
   }
 }
 
-$("rename").onclick = () => {
-  const editor = $("editor");
-  editor.hidden = !editor.hidden;
-  if (!editor.hidden) buildEditor();
-  $("rename").textContent = editor.hidden ? "Edit names" : "Cancel";
+$("toggleNames").onclick = () => {
+  panels.names = !panels.names;
+  if (panels.names) buildEditor();
+  renderSettings();
 };
 
 /* ---------- live state -------------------------------------------------- */
@@ -388,28 +444,34 @@ function listen() {
   // EventSource reconnects on its own, so a service restart or a flaky network
   // needs no handling here beyond showing that the stream is down.
   const stream = new EventSource("/api/events");
+  stream.onopen = () => { streamUp = true; renderLink(); };
   stream.onmessage = (event) => {
+    streamUp = true;
+    lastEvent = Date.now();
     const msg = JSON.parse(event.data);
     if (msg.type === "state") {
       state = msg.state;
-      // Do not leave a destructive mode armed across a dropped link: the
-      // routing it was about to capture may no longer be the one shown.
-      if (!state.connected) armed = false;
       renderAll();
     }
     if (msg.type === "labels") { labels = msg.labels; renderAll(); }
   };
   stream.onerror = () => {
+    streamUp = false;
     state = { ...state, connected: false, error: "no connection to the service" };
     renderLink();
   };
 }
+
+// Any error here would otherwise be invisible: the page would simply stop
+// following the matrix and look like a matrix with nothing to report.
+window.onerror = (message, _src, line) => { toast(`page error: ${message} (line ${line})`); };
 
 (async function start() {
   const got = await send("GET", "/api/labels");
   if (got) labels = got;
   renderAll();
   listen();
+  setInterval(renderLink, 1000);      // keeps the "last update" age honest
 })();
 </script>
 </body>

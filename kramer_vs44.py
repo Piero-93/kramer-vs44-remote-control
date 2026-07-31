@@ -145,7 +145,14 @@ class TcpTransport(Transport):
             except socket.timeout:
                 break
             if not chunk:
-                break
+                # recv() returning nothing means the far end closed the socket,
+                # which is not the same as "nothing has arrived yet". Treating
+                # the two alike is how a caller ends up convinced it is still
+                # connected to a device that is gone. Whatever was already read
+                # is handed back first; the next read raises.
+                if buf:
+                    break
+                raise ConnectionError("the device closed the connection")
             buf += chunk
             if expect and len(buf) >= expect:
                 break
@@ -655,6 +662,17 @@ def main():
     if args.cmd == "discover":
         return discover(args.cidr, tuple(args.ports) if args.ports else DISCOVER_PORTS)
 
+    try:
+        return run(args)
+    except OSError as e:
+        # Covers a refused connection, a serial port that is not there, and the
+        # device closing the socket mid-command. A traceback would tell the
+        # reader nothing they can act on.
+        print(f"ERROR: {e}")
+        return 1
+
+
+def run(args):
     with open_transport(args) as t:
         print(f"Connected: {t}")
 

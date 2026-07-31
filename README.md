@@ -7,6 +7,7 @@ The VS-44HN has **no web interface**: the only way to drive it remotely is to sp
 wire protocols. This project implements both of them — the binary **Protocol 2000** (the
 factory default) and the ASCII **Protocol 3000** — so you never have to reach the front panel.
 
+[![tests](https://github.com/Piero-93/kramer-vs44-remote-control/actions/workflows/tests.yml/badge.svg)](https://github.com/Piero-93/kramer-vs44-remote-control/actions/workflows/tests.yml)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![License](https://img.shields.io/badge/license-GPLv3-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
@@ -28,6 +29,7 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 - [Quick start](#quick-start)
 - [Command-line usage](#command-line-usage)
 - [GUI](#gui)
+- [Web service and browser UI](#web-service-and-browser-ui)
 - [First-time setup](#first-time-setup)
 - [Protocol reference](#protocol-reference)
 - [Troubleshooting](#troubleshooting)
@@ -35,6 +37,7 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 - [Known limitations](#known-limitations)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
+- [Disclaimer](#disclaimer)
 - [License](#license)
 
 ---
@@ -56,8 +59,12 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
   between commands, and that guarantee is enforced in one place instead of being scattered
   across call sites.
 - **GUI**: routing grid, named presets, editable input/output labels, live TX/RX byte log.
-- **No dependencies** for TCP and GUI use — Tkinter ships with Python. `pyserial` is needed
-  only for RS-232.
+- **Web service**: an HTTP API and a browser UI, so the matrix can be driven from a phone with
+  nothing installed on it. Front-panel presses are pushed to the page over Server-Sent Events, and
+  the connection to the matrix is re-established by itself if it drops.
+- **No dependencies at all** for TCP, GUI and web use — Tkinter and `http.server` ship with Python,
+  and the browser UI is one self-contained HTML file with no framework and no build step.
+  `pyserial` is needed only for RS-232.
 
 ## Know this before you touch the device
 
@@ -319,6 +326,178 @@ what provides immediacy. Both the checkbox and the interval are persisted.
 
 `#FACTORY` is deliberately **not** exposed as a button — see [Design notes](#design-notes).
 
+## Web service and browser UI
+
+`kramer_server.py` exposes an HTTP API and serves a single-page UI, so the matrix can be driven
+from a phone, a tablet or another machine with nothing installed on it.
+
+```bash
+python kramer_server.py
+python kramer_server.py --matrix 192.168.1.50:10001 --port 8080
+```
+
+It prints the URL to open. The page is `web/index.html`, one self-contained file with no framework,
+no build step and no external request: commands go out with `fetch()`, state arrives over
+Server-Sent Events, and both are native browser features.
+
+The page has three parts. **Routing** is the grid, with outputs as rows and inputs as columns, the
+same convention as the Tkinter GUI. **Presets** recalls, and only recalls. **Settings** holds the two
+rare operations, each behind a disclosure that is closed on arrival: renaming inputs, outputs and
+presets, and storing the current routing into a slot.
+
+The header shows two things, and the second one matters more than it looks: whether the **matrix** is
+connected, and whether **this page is still being fed**. A control panel that has quietly stopped
+receiving updates looks exactly like one where nothing is happening, so the page says `live, last
+update just now` while the stream is healthy and turns to `not receiving updates` when it is not.
+
+### ⚠️ Run one controller at a time
+
+**Do not run two controllers against the matrix at the same time** — not two copies of the service,
+and not the service alongside the Tkinter GUI. The device accepts the second connection quite
+happily; the problem is what it then reports. Measured on a VS-44HN:
+
+- a switch commanded by one client is **never** announced to the others, so each controller is blind
+  to what the others do;
+- a front-panel press is announced to **one connected client only**. With two connected, exactly one
+  of them hears it.
+
+The second point is what makes this a constraint rather than a recommendation: the client that loses
+gets **no error and no warning**. It just stops following the front panel while continuing to look
+perfectly healthy, and shows routing that is wrong. The Tkinter GUI's periodic re-read would
+eventually reconcile; the browser UI has no periodic read, because it does not need one when it is
+the only controller.
+
+Pick one per session. The Tkinter GUI remains useful as a direct-connection fallback when the
+service is not running.
+
+### Noticing that the matrix is gone
+
+A connection that is up is not evidence that the device on the other end is
+alive, and this is worth spelling out because getting it wrong is easy and the
+symptom is a UI that lies.
+
+**A powered-off or unplugged matrix leaves a socket that looks perfectly
+healthy.** Reads simply time out — exactly as they do when the device is idle
+and has nothing to report. Measured by pulling the network cable: no
+end-of-stream, no error, nothing. Silence is not information.
+
+So the service **probes the link after a stretch of silence**, sending an
+identify command and dropping the connection if the answer does not come. Two
+details that decide whether such a check works at all:
+
+- **No reply is a failure, not just an error.** The command goes out into the
+  void and returns an empty result without raising anything. A check that only
+  watched for exceptions would report the link healthy forever.
+- **The probe only fires when nothing else has succeeded recently.** While the
+  matrix is being used, its answers are the proof of life and no extra traffic is
+  generated at all.
+
+If the matrix *does* close its socket, the transport reports that immediately
+rather than mistaking it for silence, so that case needs no waiting.
+
+Once the link is lost the service retries until it comes back, then re-reads the
+routing and the presets. **Expect the recovery to take a while:** after a network
+interruption the measured VS-44HN did not answer a new connection attempt for
+about **90 seconds**, considerably longer than the outage itself — plausibly
+because from its side the old connection was never closed either and still
+occupied a slot. Nothing is wrong if the log repeats `failed: timed out` for a
+minute or two.
+
+### Options
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--matrix HOST[:PORT]` | `192.168.1.39` | the matrix, TCP port 5000 implied |
+| `--machine N` | `1` | Protocol 2000 machine number |
+| `--host ADDR` | `0.0.0.0` | address to listen on; `127.0.0.1` keeps it on this machine only |
+| `--port N` | `8000` | HTTP port |
+| `--token STRING` | none | require this token on every request |
+| `--allow-preset-store` | off | permit overwriting the hardware presets |
+| `--heartbeat SECONDS` | `30` | probe the matrix after this much silence; `0` disables the check |
+
+### Deliberate limits
+
+These are choices, not oversights:
+
+- **Protocol 2000 over TCP only.** Protocol 2000 is the factory default, it keeps the IR remote
+  working, and it is the only mode in which the matrix reports front-panel presses — which is what
+  lets this service push changes instead of polling. Protocol 3000 would gain nothing here and lose
+  that. RS-232 is not wired up either: it would be a handful of lines, but shipping a code path
+  that has never been run on real hardware is worse than not shipping it.
+- **No authentication by default.** The service is meant for a network you trust. As printed at
+  startup, **anyone who can reach the port can switch your monitors**. `--token STRING` requires
+  that token on every request, sent either as `Authorization: Bearer STRING` or as `?token=STRING`.
+  Every request passes through a single gate, so a login page can be added there later without
+  touching the routes.
+- **Do not expose this to the internet.** There is no TLS and no rate limiting. If you need access
+  from outside, put it behind a VPN.
+- **Started by hand.** Run it from a terminal, watch the log, stop it with Ctrl-C.
+- **Front-panel lock, EDID and raw commands are not exposed.** `#FACTORY` deliberately has no
+  endpoint at all, for the same reason it is not a button in the GUI.
+- **Overwriting presets is off unless you ask for it** — see below.
+
+### Presets, and overwriting them
+
+Recalling a preset is a single tap and always available. **Storing** one is different: it replaces
+the slot's contents, and it is the only destructive operation the service exposes. It is therefore
+guarded three times over, from the outside in:
+
+1. **The endpoint does not work unless the service was started with `--allow-preset-store`.**
+   Without it, `POST /api/preset/<n>/store` answers `403` and the page does not offer the function
+   at all. Presets get configured once in a while: start with the flag on that day, and the rest of
+   the time nothing reachable on the network can destroy them. This is the real gate — the two
+   below are in the page, and a page's protections are trivially bypassed by anyone able to send a
+   POST.
+2. **Storing lives in Settings, with its own buttons.** The Presets section recalls and nothing
+   else, so the part of the page used every day is incapable of destroying anything — no mode that
+   changes what a button does, and nothing to leave armed by mistake. Opening the panel sends no
+   command; it lists the routing that would be captured, with your own names, and eight slots
+   marked with a dot where they already hold a layout.
+3. **The confirmation says what will happen**, listing the routing about to be captured with your
+   own names, and stating whether the slot is empty or about to lose what it holds.
+
+The page also marks with a dot (**●**) every preset that already contains a layout. The service
+reads that at connect time with one query per slot, and refreshes it after a store.
+
+### Configuration
+
+Input, output and preset names are read from — and written to — **the same
+`kramer_gui_config.json` that the Tkinter GUI uses**, so both interfaces show the names you set
+once. "Edit names" in the browser writes them back.
+
+Writes are read-modify-write on both sides: neither program discards keys it does not own. That
+does *not* make them safe to run at once — for the names they both manage, the last writer still
+wins — which is the same reason as above for using one controller at a time.
+
+### API
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "presets", "error", "allow_preset_store"}`; `routing` maps output to input with `0` meaning disconnected, `presets` maps slot to whether it holds a layout |
+| `GET` | `/api/labels` | input, output and preset names |
+| `PUT` | `/api/labels` | any subset of `inputs`, `outputs`, `presets`; returns the complete set |
+| `POST` | `/api/route` | `{"input": 0-4, "output": 0-4}`; input `0` disconnects, output `0` means every output |
+| `POST` | `/api/preset/<n>/recall` | recalls preset 1-8, then re-reads the routing |
+| `POST` | `/api/preset/<n>/store` | overwrites preset 1-8 with the current routing; `403` unless `--allow-preset-store` |
+| `GET` | `/api/events` | Server-Sent Events; `{"type": "state"|"labels", ...}` |
+
+Status codes worth knowing: `400` for a malformed or out-of-range request, `403` when preset storing
+is disabled, `503` when the matrix is not currently connected, `504` when it did not answer in time.
+The state endpoint keeps answering while the link is down and reports `"connected": false`, so a
+client can show the truth rather than a stale grid.
+
+```bash
+curl http://localhost:8000/api/state
+curl -X POST http://localhost:8000/api/route -H 'Content-Type: application/json' -d '{"input":2,"output":3}'
+curl -X POST http://localhost:8000/api/preset/1/recall
+curl -X POST http://localhost:8000/api/preset/1/store    # needs --allow-preset-store
+curl -N http://localhost:8000/api/events
+```
+
+Every request is serialised onto the single thread that owns the socket. Concurrent callers queue;
+they never interleave commands, because doing so would break the 200 ms interval the protocol
+requires.
+
 ## First-time setup
 
 ### 1. Identify the device over serial
@@ -356,6 +535,11 @@ arp -a | findstr 192.168.1.39      # Linux/macOS: arp -a | grep 192.168.1.39
 ```
 
 If something answers, you have an IP conflict coming. Free the address first.
+
+Note the direction of that test: an answer means **something else** is on `.39`. It does not work the
+other way round — the measured VS-44HN does not reply to ICMP at all, so silence proves nothing
+about whether the matrix is there. To check for the matrix itself, test the port:
+`Test-NetConnection 192.168.1.39 -Port 5000` on Windows, `nc -z 192.168.1.39 5000` elsewhere.
 
 **Reset:** disconnect power, **hold the rear `RESET` button**, power the unit back on while
 keeping it held. The unit returns to `192.168.1.39 / 255.255.255.0`. This is a **safe**
@@ -412,7 +596,9 @@ Replies come back in the same 4-byte format with the DESTINATION bit set (`0x40`
 
 **Confirmed on real hardware** (VS-44HN, firmware 3.3, over TCP): `3D 81 80 81` (identify →
 `7D 80 AC 81`), `3D 83 80 81` (software version → `7D 83 83 81`, i.e. 3.3), `3E 8n 81 81`
-(define machine → 4 inputs, 4 outputs, 8 presets), `05 80 8n 81` (output status).
+(define machine → 4 inputs, 4 outputs, 8 presets), `05 80 8n 81` (output status), `0F 8n 80 81`
+(instruction 15, is preset *n* defined → the OUTPUT field of the reply is 1 for an occupied slot and
+0 for an empty one, cross-checked against a unit with exactly one preset saved).
 
 **Still derived from the bit layout only** — verify with `-v` before relying on it:
 `1E 81 80 81` (front-panel lock).
@@ -431,11 +617,16 @@ pressed. Measured on a VS-44HN over TCP, that is true — **but only for the fro
 
 | Event | Reported to a connected TCP client? |
 |---|---|
-| A front-panel button is pressed | **Yes.** An unprompted SWITCH VIDEO frame arrives, e.g. `41 84 83 81` = input 4 to output 3 |
+| A front-panel button is pressed | **Yes, but to one client only.** An unprompted SWITCH VIDEO frame arrives, e.g. `41 84 83 81` = input 4 to output 3. With two clients connected, measured: exactly one of them receives it |
 | Another TCP client issues `switch` | **No.** A listener on a second socket saw nothing while two switches were performed |
 
 So the state of the physical panel can be followed with no polling at all, which is what the GUI
 does. Changes made by other software on the network cannot, and need a periodic re-read.
+
+The "one client only" part is the sharp edge, and it is why running two controllers is a technical
+constraint rather than a preference: the loser gets **no error and no indication** — it simply stops
+hearing the front panel and shows routing that is quietly wrong. Which of the two wins has not been
+established, and it does not much matter: you cannot rely on being the one that does.
 
 Two useful side findings from the same tests:
 
@@ -490,6 +681,11 @@ Maximum 64 characters per string. Commands can be concatenated with `|`.
 | `AUTOREFRESH_INTERVALS` | `(5, 10, 30, 60)` | GUI, seconds |
 | `FOCUS_REFRESH_MIN_GAP` | `1.5` | GUI, throttles refresh-on-focus |
 | `Worker.IDLE_POLL` | `0.2` | GUI, seconds spent listening between jobs |
+| `DeviceLink.IDLE_POLL` | `0.2` | service, seconds spent listening between jobs |
+| `DeviceLink.RECONNECT_DELAY` | `3.0` | service, pause before retrying a failed connection |
+| `DeviceLink.HEARTBEAT` | `30.0` | service, silence tolerated before probing the link |
+| `SSE_KEEPALIVE` | `15.0` | service, seconds between event-stream keepalives |
+| `SSE_BACKLOG` | `32` | service, events buffered per browser before dropping |
 
 ### A note on read timing
 
@@ -501,6 +697,10 @@ to 0.9 s**: it applies to every command, not just to the automatic refresh.
 If you add a command whose reply length you know, pass `expect`. If you do not know it, leave it
 out and accept the timeout — do not guess.
 
+A read that hits end of stream raises `ConnectionError` rather than returning empty, because a
+closed socket and an idle device are not the same thing and treating them alike is how a caller
+stays convinced it is talking to hardware that is gone.
+
 ## Troubleshooting
 
 | Symptom | Likely cause |
@@ -509,6 +709,9 @@ out and accept the timeout — do not guess.
 | No reply over TCP although the port is open | wrong protocol → try `--proto p2000` and `--proto p3000` |
 | `discover` finds nothing | static IP on another subnet → use the rear `RESET` button |
 | The matrix disappears from the network periodically | IP conflict: `.39` is inside the DHCP pool → reserve it |
+| `ping` gets no answer | **Not a verdict.** The measured unit does not reply to ICMP at all while happily accepting TCP on port 5000. Test the port, not the ping: `Test-NetConnection 192.168.1.39 -Port 5000` on Windows, `nc -z 192.168.1.39 5000` elsewhere |
+| It will not reconnect for a minute or two after a network interruption | Expected. The device took about 90 s to answer a new connection after the cable was restored |
+| The service says it is connected but nothing responds | Only possible with `--heartbeat 0`. Silence is indistinguishable from an idle device, so without the probe a dead link is never noticed |
 | Commands ignored when sent in bursts | you are going below 200 ms → do not work around `MIN_CMD_INTERVAL` |
 | The IR remote stopped responding | the unit is in Protocol 3000 → `proto-switch p2000` |
 | Truncated or mixed replies | dirty buffer — the tool calls `flush_input()`, but `raw` can leave residue |
@@ -539,7 +742,16 @@ These are deliberate choices, not accidents.
    messier than the reverse.
 7. **In the GUI grid, outputs are rows and inputs are columns.** The physical constraint is
    "each output has exactly one input", so the radio group belongs to the output, and a row is
-   read in the natural direction.
+   read in the natural direction. The browser UI keeps the same convention.
+8. **The web service holds its connection open permanently.** Not for speed: the matrix reports
+   front-panel presses only to a client that is connected and reading, so a connect-per-request
+   design would see nothing. That is also why the service has to detect a dropped link and repair
+   it itself.
+9. **One controller at a time.** Measured, not assumed: with two clients connected the device
+   announces a front-panel press to only one of them, and tells the other nothing. Silent staleness
+   is the worst failure mode a control panel can have, so the honest fix is not to create the
+   situation. The alternative — making every interface a client of one owning process — is real work,
+   and it is the only thing that would actually make two interfaces safe.
 
 ## Known limitations
 
@@ -549,11 +761,14 @@ These are deliberate choices, not accidents.
   verify: route input 1 to output 4 only, then click *Refresh state*. If the mark appears on
   (out 4, in 1) the assumption holds; if it appears on (out 1, in 4), set the constant to
   `False`.
-- **Switches made by other software are not announced.** The device reports front-panel presses
-  but not commands issued by another client, so those are only picked up by the periodic re-read.
-- **No TCP reconnection.** There is currently no socket-drop detection: if the matrix is powered
-  off, the GUI still believes it is connected. Auto-refresh does turn itself off on the first
-  error, which surfaces the problem, but the connection indicator stays green.
+- **Two controllers cannot both stay in sync, and neither is told so.** The device announces a
+  front-panel press to one connected client only, and never announces a command issued by another
+  client. Whichever controller loses shows stale routing with no error — hence one at a time.
+- **The Tkinter GUI does not reconnect, and does not probe the link.** If the matrix closes its
+  socket the next read now fails, so auto-refresh turns itself off and says so — but if the matrix
+  dies *silently*, which is what pulling the cable produces, the GUI notices nothing until you ask
+  it to do something, and the indicator stays green. Only the web service probes for this.
+- **The web service has no authentication unless you set `--token`,** and no TLS in any case.
 - **The protocol layer has no unit tests yet.** The GUI and the state tracking are covered by
   `tests/`; frame generation and the parsing helpers are currently only exercised through
   `--dry-run` and against hardware.
@@ -563,17 +778,15 @@ These are deliberate choices, not accidents.
 
 - **OS-level hotkeys** binding preset recall to a key combination — the original motivation for
   the project. A resident helper may be needed if Python's startup time is noticeable.
-- **REST API** exposing routing and presets over HTTP. Note the hard constraint: every request
-  must be serialised through a single command queue, otherwise the 200 ms protocol rate limit is
-  violated by concurrent requests.
-- **Web GUI** on top of that API, so the matrix can be controlled from a phone or tablet without
-  installing anything.
-- **TCP robustness**: keepalive, timeout, automatic return to a disconnected state.
+- **Reconnection in the Tkinter GUI**, which the web service already does.
 - **Protocol unit tests**: `parse_raw`, `parse_vid_reply`, `hexdump`, and Protocol 2000 frame
-  generation compared against the verified byte sequences above. The GUI side already has
-  coverage in [`tests/`](tests/).
-- **Reconnection after a socket drop**, which would also restore passive listening automatically
-  instead of leaving it disabled until the user reconnects.
+  generation compared against the verified byte sequences above. The GUI and the service already
+  have coverage in [`tests/`](tests/).
+- **A login page for the web UI**, if it ever needs to leave a trusted network. The request gate is
+  already one function; sessions and cookies are the work.
+- **Making the Tkinter GUI a client of the HTTP API** instead of opening a second direct
+  connection — the only way both interfaces could run at once without either going stale.
+- **Serial transport and Protocol 3000 in the web service**, neither wired up today.
 - **Preset contents in the UI**: store the routing snapshot locally so each preset shows what it
   actually does (`#PRST-VID?` can read it back from the device on Protocol 3000).
 
@@ -588,15 +801,17 @@ Issues and pull requests are welcome, especially:
 When reporting protocol behaviour, please include the output of the relevant command with `-v`
 so the raw bytes are visible.
 
-Before opening a pull request, run the offline checks — they need no hardware and exit non-zero on
-failure:
+The three offline suites run in CI on every push and pull request, so a broken change shows up
+without anyone remembering to look. Running them locally first is still faster:
 
 ```bash
+python tests/test_protocol_offline.py
+python tests/test_server_offline.py
 python tests/test_gui_offline.py
 ```
 
-See [`tests/README.md`](tests/README.md) for the live integration test, which needs a matrix on the
-network.
+See [`tests/README.md`](tests/README.md) for the live integration tests, which need a matrix on the
+network and are therefore not part of CI.
 
 ## Disclaimer
 

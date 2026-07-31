@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<!--
+  kramer-vs44-remote-control - web UI for a Kramer VS-44HN HDMI matrix.
+  Copyright (C) 2026 Piero Biagini. Licensed under the GNU GPL v3 or later.
+
+  Deliberately one self-contained file: no framework, no build step, no external
+  request. Commands go out with fetch(), state comes in over Server-Sent Events,
+  and both are native browser features.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#1f7a4d">
+<title>Kramer VS-44HN</title>
+<!-- Inline so the page stays a single file with no external request: a 2x2 grid,
+     which is what reads at 16 px better than an actual 4x4 would. -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%231f7a4d'/><g fill='%23fff'><rect x='7' y='7' width='8' height='8' rx='2'/><rect x='17' y='7' width='8' height='8' rx='2'/><rect x='7' y='17' width='8' height='8' rx='2'/><rect x='17' y='17' width='8' height='8' rx='2'/></g></svg>">
+<style>
+  :root {
+    --bg: #f4f5f7; --panel: #fff; --line: #dcdfe4; --text: #1a1d21;
+    --muted: #6b7280; --accent: #1f7a4d; --accent-text: #fff;
+    --danger: #b03030; --idle: #f0f1f3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c; --panel: #1e2126; --line: #32363d; --text: #e8eaed;
+      --muted: #9aa0a8; --accent: #2f9d63; --accent-text: #0d0f11;
+      --danger: #e06b6b; --idle: #262a30;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1rem; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 46rem; margin: 0 auto; }
+  h1 { font-size: 1.15rem; margin: 0; font-weight: 600; }
+  h2 {
+    font-size: .8rem; text-transform: uppercase; letter-spacing: .06em;
+    color: var(--muted); margin: 0 0 .6rem; font-weight: 600;
+  }
+  header {
+    display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap;
+    margin-bottom: 1rem;
+  }
+  #link { font-size: .85rem; color: var(--muted); }
+  #link::before {
+    content: "●"; margin-right: .3rem; color: var(--danger);
+  }
+  #link.up::before { color: var(--accent); }
+  section {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    padding: .9rem; margin-bottom: .9rem;
+  }
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 22rem; }
+  th, td { padding: .2rem; text-align: center; }
+  th { font-weight: 500; font-size: .85rem; color: var(--muted); }
+  th.out, td.out { text-align: left; white-space: nowrap; }
+  button {
+    font: inherit; color: inherit; background: var(--idle);
+    border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
+    padding: .5rem .6rem; min-width: 2.6rem; min-height: 2.6rem;
+  }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: .45; cursor: default; }
+  td button { width: 100%; }
+  button.on {
+    background: var(--accent); color: var(--accent-text);
+    border-color: var(--accent); font-weight: 600;
+  }
+  button.arm { border-color: var(--danger); color: var(--danger); }
+  .dot { color: var(--accent); font-size: .7em; vertical-align: .15em; }
+  button.arm .dot { color: currentColor; }
+  .hint { color: var(--muted); font-size: .85rem; }
+  .hint.warn { color: var(--danger); }
+  #presets { display: grid; gap: .5rem; grid-template-columns: repeat(2, 1fr); }
+  @media (min-width: 34rem) {
+    #presets { grid-template-columns: repeat(4, 1fr); }
+  }
+  #presets button { text-align: left; }
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  input[type=text] {
+    font: inherit; color: inherit; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; padding: .35rem .4rem;
+    width: 100%; min-width: 5rem;
+  }
+  #toast {
+    position: fixed; left: 1rem; right: 1rem; bottom: 1rem; margin: 0 auto;
+    max-width: 30rem; background: var(--danger); color: #fff;
+    padding: .6rem .8rem; border-radius: 8px; font-size: .9rem;
+    box-shadow: 0 4px 16px rgba(0,0,0,.25);
+  }
+  #toast[hidden] { display: none; }
+  footer { color: var(--muted); font-size: .8rem; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Kramer VS-44HN</h1>
+    <span id="link">connecting…</span>
+    <span id="live" class="hint"></span>
+  </header>
+
+  <section>
+    <h2>Routing</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr id="head"></tr></thead>
+        <tbody id="grid"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Presets</h2>
+    <div id="presets"></div>
+    <span id="presetHint" class="hint"></span>
+  </section>
+
+  <section>
+    <h2>Settings</h2>
+    <div class="row">
+      <button id="toggleNames">▸ Edit names</button>
+      <button id="toggleStore" class="arm" hidden>▸ Save the current routing</button>
+      <span id="settingsHint" class="hint"></span>
+    </div>
+    <div id="editor" hidden></div>
+    <div id="storePanel" hidden></div>
+  </section>
+
+  <footer>Run one controller at a time: the matrix does not report another
+    client's switches.</footer>
+</main>
+
+<div id="toast" hidden></div>
+
+<script>
+"use strict";
+
+const N_IO = 4, N_PRESETS = 8;
+const $ = (id) => document.getElementById(id);
+
+let state = { connected: false, routing: {}, presets: {}, detail: "", error: null };
+let labels = { inputs: [], outputs: [], presets: [] };
+let busy = false;
+// Storing overwrites a preset, and it is the only destructive action here. It
+// therefore lives in Settings with its own buttons rather than re-purposing the
+// preset buttons: the section used every day stays incapable of destroying
+// anything, and there is no armed state to forget about.
+const panels = { names: false, store: false };
+// Transient confirmations have to survive a re-render: a store publishes a state
+// event that comes straight back, so anything written directly into the DOM
+// would be wiped a few milliseconds later.
+let notice = "";
+let streamUp = false;
+let lastEvent = 0;
+
+function say(message) {
+  notice = message;
+  renderSettings();
+  clearTimeout(say.timer);
+  say.timer = setTimeout(() => { notice = ""; renderSettings(); }, 4000);
+}
+
+/* ---------- rendering ---------------------------------------------------- */
+
+function renderLink() {
+  const el = $("link");
+  el.classList.toggle("up", state.connected);
+  if (state.connected) {
+    el.textContent = `${state.detail}${state.protocol ? " — " + state.protocol : ""}`;
+  } else {
+    el.textContent = state.error || "not connected to the matrix";
+  }
+
+  // Whether this page is still being fed, and when it last heard anything. A
+  // control panel that has silently stopped listening looks exactly like one
+  // where nothing is happening, and that is the failure worth making visible.
+  const live = $("live");
+  if (!streamUp) {
+    live.textContent = "· not receiving updates";
+    live.className = "hint warn";
+    return;
+  }
+  const age = Math.round((Date.now() - lastEvent) / 1000);
+  live.textContent = `· live, last update ${age < 2 ? "just now" : age + "s ago"}`;
+  live.className = "hint";
+}
+
+function renderGrid() {
+  const head = $("head");
+  head.textContent = "";
+  head.appendChild(th("output \\ input", "out"));
+  for (let i = 1; i <= N_IO; i++) head.appendChild(th(labels.inputs[i - 1]));
+  head.appendChild(th("off"));
+
+  const body = $("grid");
+  body.textContent = "";
+  for (let o = 1; o <= N_IO; o++) {
+    const tr = document.createElement("tr");
+    const name = document.createElement("td");
+    name.className = "out";
+    name.textContent = labels.outputs[o - 1];
+    tr.appendChild(name);
+    for (let i = 1; i <= N_IO; i++) tr.appendChild(cell(i, o));
+    tr.appendChild(cell(0, o, "×"));
+    body.appendChild(tr);
+  }
+}
+
+function th(text, cls) {
+  const el = document.createElement("th");
+  el.textContent = text;
+  if (cls) el.className = cls;
+  return el;
+}
+
+function cell(input, output, text) {
+  const td = document.createElement("td");
+  const b = document.createElement("button");
+  b.textContent = text || String(input);
+  b.disabled = busy || !state.connected;
+  if (Number(state.routing[output]) === input) b.classList.add("on");
+  b.title = input === 0
+    ? `Disconnect ${labels.outputs[output - 1]}`
+    : `${labels.inputs[input - 1]} to ${labels.outputs[output - 1]}`;
+  b.onclick = () => route(input, output);
+  td.appendChild(b);
+  return td;
+}
+
+function presetButton(n, destructive) {
+  const b = document.createElement("button");
+  b.append(destructive ? String(n) : labels.presets[n - 1]);
+  if (state.presets && state.presets[n]) {
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    dot.textContent = " ●";
+    dot.title = "holds a layout";
+    b.appendChild(dot);
+  }
+  b.disabled = busy || !state.connected;
+  if (destructive) {
+    b.classList.add("arm");
+    b.title = `Overwrite ${labels.presets[n - 1]} with the current routing`;
+    b.onclick = () => store(n);
+  } else {
+    b.title = `Recall ${labels.presets[n - 1]}`;
+    b.onclick = () => recall(n);
+  }
+  return b;
+}
+
+function renderPresets() {
+  const box = $("presets");
+  box.textContent = "";
+  for (let n = 1; n <= N_PRESETS; n++) box.appendChild(presetButton(n, false));
+  $("presetHint").textContent = "● marks a preset that already holds a layout.";
+}
+
+function renderSettings() {
+  const canStore = !!state.allow_preset_store;
+  $("toggleStore").hidden = !canStore;
+  $("toggleStore").disabled = busy || !state.connected;
+  $("toggleNames").textContent = (panels.names ? "▾" : "▸") + " Edit names";
+  $("toggleStore").textContent =
+    (panels.store ? "▾" : "▸") + " Save the current routing";
+  $("editor").hidden = !panels.names;
+  $("storePanel").hidden = !panels.store;
+  $("settingsHint").textContent = notice ||
+    (canStore ? "" : "Overwriting presets is disabled on this service.");
+  if (panels.store) renderStorePanel();
+}
+
+function renderAll() {
+  renderLink();
+  renderGrid();
+  renderPresets();
+  renderSettings();
+}
+
+function toast(message) {
+  const el = $("toast");
+  el.textContent = message;
+  el.hidden = false;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { el.hidden = true; }, 6000);
+}
+
+/* ---------- talking to the service -------------------------------------- */
+
+async function send(method, path, body) {
+  busy = true;
+  renderAll();
+  try {
+    const res = await fetch(path, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+    return payload;
+  } catch (e) {
+    toast(e.message);
+    return null;
+  } finally {
+    busy = false;
+    renderAll();
+  }
+}
+
+async function route(input, output) {
+  const res = await send("POST", "/api/route", { input, output });
+  if (res) { state = res; renderAll(); }
+}
+
+async function recall(n) {
+  const res = await send("POST", `/api/preset/${n}/recall`);
+  if (res) { state = res; renderAll(); }
+}
+
+function routingLines() {
+  const lines = [];
+  for (let o = 1; o <= N_IO; o++) {
+    const i = Number(state.routing[o]);
+    lines.push(`${labels.outputs[o - 1]} ← ` +
+               (i === 0 ? "nothing" : labels.inputs[i - 1]));
+  }
+  return lines;
+}
+
+function renderStorePanel() {
+  // Rebuilt on every state change, so the layout listed here is the one that
+  // would actually be captured rather than whatever it was when opened.
+  const box = $("storePanel");
+  box.textContent = "";
+  const list = document.createElement("div");
+  list.className = "hint";
+  list.style.margin = ".6rem 0";
+  for (const line of routingLines()) {
+    const div = document.createElement("div");
+    div.textContent = line;
+    list.appendChild(div);
+  }
+  box.appendChild(list);
+
+  const label = document.createElement("div");
+  label.className = "hint warn";
+  label.textContent = "Save into — this replaces whatever the slot holds:";
+  box.appendChild(label);
+
+  const row = document.createElement("div");
+  row.className = "row";
+  row.style.marginTop = ".4rem";
+  for (let n = 1; n <= N_PRESETS; n++) row.appendChild(presetButton(n, true));
+  box.appendChild(row);
+}
+
+async function store(n) {
+  // Say what is about to happen, not just "are you sure": a warning nobody can
+  // act on is a warning everybody clicks through.
+  const name = labels.presets[n - 1];
+  const occupied = state.presets && state.presets[n];
+  const message =
+    `Store the current routing into "${name}"?\n\n` +
+    routingLines().map((l) => "  " + l).join("\n") + "\n\n" +
+    (occupied ? `"${name}" already holds a layout and it will be lost.`
+              : `"${name}" is currently empty.`);
+  if (!confirm(message)) return;
+  const res = await send("POST", `/api/preset/${n}/store`);
+  if (res) {
+    state = res;
+    renderAll();
+    say(`Saved into "${name}".`);
+  }
+}
+
+$("toggleStore").onclick = () => { panels.store = !panels.store; renderSettings(); };
+
+/* ---------- editing the names ------------------------------------------- */
+
+const GROUPS = [
+  ["inputs", "Inputs", N_IO],
+  ["outputs", "Outputs", N_IO],
+  ["presets", "Presets", N_PRESETS],
+];
+
+function buildEditor() {
+  const box = $("editor");
+  box.textContent = "";
+  for (const [key, title, count] of GROUPS) {
+    const h = document.createElement("h2");
+    h.textContent = title;
+    h.style.marginTop = ".8rem";
+    box.appendChild(h);
+    const row = document.createElement("div");
+    row.id = `edit-${key}`;
+    row.className = "row";
+    for (let i = 0; i < count; i++) {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.value = labels[key][i];
+      input.maxLength = 40;
+      input.style.flex = "1 1 7rem";
+      row.appendChild(input);
+    }
+    box.appendChild(row);
+  }
+  const actions = document.createElement("div");
+  actions.className = "row";
+  actions.style.marginTop = ".8rem";
+  const save = document.createElement("button");
+  save.textContent = "Save names";
+  save.onclick = saveNames;
+  actions.appendChild(save);
+  box.appendChild(actions);
+}
+
+async function saveNames() {
+  const payload = {};
+  for (const [key] of GROUPS) {
+    payload[key] = [...$(`edit-${key}`).querySelectorAll("input")]
+      .map((el) => el.value.trim() || "—");
+  }
+  const res = await send("PUT", "/api/labels", payload);
+  if (res) {
+    labels = res;
+    panels.names = false;
+    renderAll();
+    say("Names saved.");
+  }
+}
+
+$("toggleNames").onclick = () => {
+  panels.names = !panels.names;
+  if (panels.names) buildEditor();
+  renderSettings();
+};
+
+/* ---------- live state -------------------------------------------------- */
+
+function listen() {
+  // EventSource reconnects on its own, so a service restart or a flaky network
+  // needs no handling here beyond showing that the stream is down.
+  const stream = new EventSource("/api/events");
+  stream.onopen = () => { streamUp = true; renderLink(); };
+  stream.onmessage = (event) => {
+    streamUp = true;
+    lastEvent = Date.now();
+    const msg = JSON.parse(event.data);
+    if (msg.type === "state") {
+      state = msg.state;
+      renderAll();
+    }
+    if (msg.type === "labels") { labels = msg.labels; renderAll(); }
+  };
+  stream.onerror = () => {
+    streamUp = false;
+    state = { ...state, connected: false, error: "no connection to the service" };
+    renderLink();
+  };
+}
+
+// Any error here would otherwise be invisible: the page would simply stop
+// following the matrix and look like a matrix with nothing to report.
+window.onerror = (message, _src, line) => { toast(`page error: ${message} (line ${line})`); };
+
+(async function start() {
+  const got = await send("GET", "/api/labels");
+  if (got) labels = got;
+  renderAll();
+  listen();
+  setInterval(renderLink, 1000);      // keeps the "last update" age honest
+})();
+</script>
+</body>
+</html>

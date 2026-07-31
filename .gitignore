@@ -21,6 +21,10 @@ handoff-*.md
 handoff/
 
 # --- Local deployment helpers, not part of the project ----------------------
+# The committed docker-compose.yml is the template, with placeholders. A .local
+# one holds the real addresses and a token, so it stays here.
+docker-compose.local.yml
+docker-compose.override.yml
 kramer-server.sh
 kramer-server.pid
 kramer-server.log

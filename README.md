@@ -1,16 +1,26 @@
-# kramer-vs44-remote-control
+<p align="center">
+  <img src="packaging/kramer.png" width="96" height="96" alt="">
+</p>
 
-Control a **Kramer VS-44HN** 4×4 HDMI matrix switcher from a PC over **TCP/IP** or **RS-232**,
-with a command-line tool and a Tkinter GUI. No external dependencies for network use.
+<h1 align="center">kramer-vs44-remote-control</h1>
+
+<p align="center">
+  Control a <strong>Kramer VS-44HN</strong> 4×4 HDMI matrix switcher over
+  <strong>TCP/IP</strong> or <strong>RS-232</strong><br>
+  from a command line, a desktop window, or a browser — with no third-party dependencies.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Piero-93/kramer-vs44-remote-control/actions/workflows/tests.yml"><img src="https://github.com/Piero-93/kramer-vs44-remote-control/actions/workflows/tests.yml/badge.svg" alt="tests"></a>
+  <a href="https://github.com/Piero-93/kramer-vs44-remote-control/releases/latest"><img src="https://img.shields.io/github/v/release/Piero-93/kramer-vs44-remote-control" alt="latest release"></a>
+  <img src="https://img.shields.io/badge/python-3.8%2B-blue" alt="Python 3.8+">
+  <img src="https://img.shields.io/badge/license-GPLv3-green" alt="GPLv3">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Windows, Linux, macOS">
+</p>
 
 The VS-44HN has **no web interface**: the only way to drive it remotely is to speak its raw
 wire protocols. This project implements both of them — the binary **Protocol 2000** (the
 factory default) and the ASCII **Protocol 3000** — so you never have to reach the front panel.
-
-[![tests](https://github.com/Piero-93/kramer-vs44-remote-control/actions/workflows/tests.yml/badge.svg)](https://github.com/Piero-93/kramer-vs44-remote-control/actions/workflows/tests.yml)
-![Python](https://img.shields.io/badge/python-3.8%2B-blue)
-![License](https://img.shields.io/badge/license-GPLv3-green)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 
 > **Status.** Verified against the official VS-44HN manual (P/N 2900-300161 Rev 8) and exercised
 > on real hardware over LAN: a VS-44HN running firmware **3.3**, reporting 4 inputs, 4 outputs

@@ -147,11 +147,22 @@ finally:
     kp.program_dir = saved_program_dir
     set_env(saved_env)
 
-# The real checkout has a settings file next to the scripts, so the resolved
-# path must still be exactly the one used before any of this existed. If this
-# check ever fails, someone's labels have just moved.
-check("this checkout still resolves to its own settings file",
-      kp.config_path(), kp.program_dir() / kp.CONFIG_NAME)
+# On a working copy that already has a settings file next to the scripts - which
+# is what a developer machine looks like - the resolved path must still be
+# exactly the one used before any of this existed. If this check ever fails,
+# someone's labels have just moved.
+#
+# It is conditional on purpose. The file is gitignored, so a fresh clone does not
+# have one and portable mode correctly does not apply: asserting it
+# unconditionally would be asserting a property of one machine rather than of the
+# code. The rule itself is covered above, against a temporary directory.
+here = kp.program_dir() / kp.CONFIG_NAME
+if here.exists():
+    check("an existing settings file next to the scripts stays the one used",
+          kp.config_path(), here)
+else:
+    results.append((True, "no settings file beside the program: portable-mode "
+                          "check skipped, as on a fresh clone"))
 
 
 # --- reading ---------------------------------------------------------------- #

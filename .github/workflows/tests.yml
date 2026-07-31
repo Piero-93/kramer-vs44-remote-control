@@ -1,14 +1,13 @@
 name: tests
 
+# Push only, on every branch. A pull_request trigger as well would run the same
+# commit twice, and a pull request shows the status of its commits anyway - which
+# the push run has already produced.
 on:
   push:
-  pull_request:
 
-# A second push to the same branch makes the first run irrelevant.
-concurrency:
-  group: tests-${{ github.ref }}
-  cancel-in-progress: true
-
+# Deliberately no concurrency group: cancelling a superseded run saves seconds
+# that nobody needs here, and costs a commit with no verdict of its own.
 jobs:
   offline:
     name: offline suites

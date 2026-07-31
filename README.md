@@ -350,16 +350,23 @@ update just now` while the stream is healthy and turns to `not receiving updates
 
 ### ⚠️ Run one controller at a time
 
-**Do not run the web service and the Tkinter GUI against the matrix simultaneously.** This is not
-about the device refusing two connections — it accepts them. It is about what it reports: the
-matrix announces **front-panel presses** to every connected client, but **never a switch commanded
-by another client**. So each controller sees the front panel correctly and is blind to the other's
-commands, and whichever one you are not looking at will show routing that is quietly wrong. The
-Tkinter GUI's periodic re-read will eventually reconcile; the browser UI has no periodic read at
-all, because it does not need one when it is the only controller.
+**Do not run two controllers against the matrix at the same time** — not two copies of the service,
+and not the service alongside the Tkinter GUI. The device accepts the second connection quite
+happily; the problem is what it then reports. Measured on a VS-44HN:
 
-Pick one for a given session. The Tkinter GUI remains useful as a direct-connection fallback when
-the service is not running.
+- a switch commanded by one client is **never** announced to the others, so each controller is blind
+  to what the others do;
+- a front-panel press is announced to **one connected client only**. With two connected, exactly one
+  of them hears it.
+
+The second point is what makes this a constraint rather than a recommendation: the client that loses
+gets **no error and no warning**. It just stops following the front panel while continuing to look
+perfectly healthy, and shows routing that is wrong. The Tkinter GUI's periodic re-read would
+eventually reconcile; the browser UI has no periodic read, because it does not need one when it is
+the only controller.
+
+Pick one per session. The Tkinter GUI remains useful as a direct-connection fallback when the
+service is not running.
 
 ### Noticing that the matrix is gone
 
@@ -608,11 +615,16 @@ pressed. Measured on a VS-44HN over TCP, that is true — **but only for the fro
 
 | Event | Reported to a connected TCP client? |
 |---|---|
-| A front-panel button is pressed | **Yes.** An unprompted SWITCH VIDEO frame arrives, e.g. `41 84 83 81` = input 4 to output 3 |
+| A front-panel button is pressed | **Yes, but to one client only.** An unprompted SWITCH VIDEO frame arrives, e.g. `41 84 83 81` = input 4 to output 3. With two clients connected, measured: exactly one of them receives it |
 | Another TCP client issues `switch` | **No.** A listener on a second socket saw nothing while two switches were performed |
 
 So the state of the physical panel can be followed with no polling at all, which is what the GUI
 does. Changes made by other software on the network cannot, and need a periodic re-read.
+
+The "one client only" part is the sharp edge, and it is why running two controllers is a technical
+constraint rather than a preference: the loser gets **no error and no indication** — it simply stops
+hearing the front panel and shows routing that is quietly wrong. Which of the two wins has not been
+established, and it does not much matter: you cannot rely on being the one that does.
 
 Two useful side findings from the same tests:
 
@@ -733,10 +745,11 @@ These are deliberate choices, not accidents.
    front-panel presses only to a client that is connected and reading, so a connect-per-request
    design would see nothing. That is also why the service has to detect a dropped link and repair
    it itself.
-9. **One controller at a time**, for the reason in
-   [Run one controller at a time](#️-run-one-controller-at-a-time). The alternative — making every
-   interface a client of one owning process — is real work with no benefit until you actually run
-   two at once.
+9. **One controller at a time.** Measured, not assumed: with two clients connected the device
+   announces a front-panel press to only one of them, and tells the other nothing. Silent staleness
+   is the worst failure mode a control panel can have, so the honest fix is not to create the
+   situation. The alternative — making every interface a client of one owning process — is real work,
+   and it is the only thing that would actually make two interfaces safe.
 
 ## Known limitations
 
@@ -746,8 +759,9 @@ These are deliberate choices, not accidents.
   verify: route input 1 to output 4 only, then click *Refresh state*. If the mark appears on
   (out 4, in 1) the assumption holds; if it appears on (out 1, in 4), set the constant to
   `False`.
-- **Switches made by other software are not announced.** The device reports front-panel presses
-  but not commands issued by another client, which is why only one controller should run at a time.
+- **Two controllers cannot both stay in sync, and neither is told so.** The device announces a
+  front-panel press to one connected client only, and never announces a command issued by another
+  client. Whichever controller loses shows stale routing with no error — hence one at a time.
 - **The Tkinter GUI does not reconnect, and does not probe the link.** If the matrix closes its
   socket the next read now fails, so auto-refresh turns itself off and says so — but if the matrix
   dies *silently*, which is what pulling the cable produces, the GUI notices nothing until you ask

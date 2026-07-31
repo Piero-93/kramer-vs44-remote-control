@@ -458,9 +458,14 @@ These are choices, not oversights:
 
 ### Running it as a service with Docker
 
-The image contains the API, the page and nothing else — no GUI, no Tkinter, no `pyserial`, no tests,
-and **no settings file**, which matters more than it sounds: a settings file inside the image would
-sit next to the program and therefore win over the mounted volume.
+The image contains the API, the page and nothing else: no GUI, no `pyserial`, no tests, no usable
+Tkinter, and **no settings file** — which matters more than it sounds, because a settings file inside
+the image would sit next to the program and therefore win over the mounted volume.
+
+Verified on a real TrueNAS Scale box, against a real matrix: it connects, the names survive a
+`docker compose restart`, and it is talking to the matrix again about **3 seconds** after one. That
+last number is the point of handling `SIGTERM` — an ungracefully dropped connection leaves the matrix
+refusing new ones for roughly 90 seconds.
 
 ```bash
 docker run -d --name kramer-vs44 -p 8000:8000 \

@@ -119,7 +119,10 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            # Not on a pre-release. A tag like v0.1.0-rc1 exists precisely so it
+            # can be tried without anyone getting it by accident, and moving
+            # latest onto it would defeat that.
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Push
         if: startsWith(github.ref, 'refs/tags/')

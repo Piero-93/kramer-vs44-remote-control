@@ -23,5 +23,7 @@
     "Preset 6",
     "Preset 7",
     "Preset 8"
-  ]
+  ],
+  "autorefresh": false,
+  "autorefresh_interval": 10
 }

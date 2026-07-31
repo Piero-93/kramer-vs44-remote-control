@@ -1,0 +1,12 @@
+# Deny everything, then name what ships. The inverse - listing what to exclude -
+# would be one forgotten line away from copying a settings file into the image,
+# and a settings file next to the program *beats the mounted volume*, because
+# that is how portable mode is defined. Note that .gitignore does not apply to a
+# build context: only this file does.
+*
+
+!kramer_vs44.py
+!kramer_server.py
+!kramer_paths.py
+!web/
+!web/**

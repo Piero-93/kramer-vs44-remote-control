@@ -350,6 +350,44 @@ try:
 except SystemExit as e:
     check("a non-numeric port is rejected", e.code, 2)
 
+# --- stopping cleanly when a container asks --------------------------------- #
+# Docker stops with SIGTERM, whose default disposition skips the cleanup, leaving
+# the socket open as far as the matrix is concerned - and it then refuses a new
+# connection for about 90 seconds. The handler is called directly rather than
+# signalled, so this check runs on Windows too.
+try:
+    ks.stop_on_signal(15, None)
+    check("a stop signal raises KeyboardInterrupt", "no exception",
+          "KeyboardInterrupt")
+except KeyboardInterrupt:
+    check("a stop signal raises KeyboardInterrupt", "KeyboardInterrupt",
+          "KeyboardInterrupt")
+
+installed = []
+real_signal = ks.signal.signal
+ks.signal.signal = lambda num, handler: installed.append((num, handler))
+try:
+    ks.install_stop_signals()
+finally:
+    ks.signal.signal = real_signal
+check("SIGTERM is the signal handled", [n for n, _ in installed],
+      [ks.signal.SIGTERM])
+check("and it is our handler", [h for _, h in installed], [ks.stop_on_signal])
+
+# --- knowing it is in a container ------------------------------------------- #
+saved_marker = os.environ.get("KRAMER_IN_CONTAINER")
+try:
+    os.environ["KRAMER_IN_CONTAINER"] = "1"
+    check("the marker variable is believed", ks.in_container(), True)
+    os.environ["KRAMER_IN_CONTAINER"] = ""
+    check("and a blank one is not", ks.in_container(),
+          Path("/.dockerenv").exists())
+finally:
+    if saved_marker is None:
+        os.environ.pop("KRAMER_IN_CONTAINER", None)
+    else:
+        os.environ["KRAMER_IN_CONTAINER"] = saved_marker
+
 # --- the event stream ------------------------------------------------------ #
 received = queue.Queue()
 

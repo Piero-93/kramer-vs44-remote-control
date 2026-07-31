@@ -1,0 +1,133 @@
+name: image
+
+# Docker is not available on the development machine, so CI building the image on
+# every push is the only feedback loop the Dockerfile gets at all. workflow_dispatch
+# is here for the same reason: being able to rebuild without inventing a commit.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  image:
+    name: build and verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # ghcr.io, on tags only; GITHUB_TOKEN is enough
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      # amd64 only: the target is TrueNAS Scale on x86-64. Adding arm64 means
+      # QEMU emulation and a much slower build, for nothing that is used today.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: kramer-vs44:ci
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The checks below run against the built image rather than against a copy of
+      # the source, because what matters is what is actually inside it.
+
+      - name: The image contains only what should ship
+        run: |
+          docker run --rm --entrypoint python kramer-vs44:ci -c "
+          import pathlib, sys
+          # A settings file here would sit next to the program and therefore beat
+          # the mounted /config volume. The GUI has no business in a headless
+          # image either, and Tkinter must not be importable at all.
+          forbidden = ['/app/kramer_gui.py', '/app/kramer_gui_config.json',
+                       '/app/tests', '/app/README.md', '/app/.git',
+                       '/app/Dockerfile', '/app/handoff-kramer-vs44.md']
+          present = [p for p in forbidden if pathlib.Path(p).exists()]
+          shipped = sorted(p.name for p in pathlib.Path('/app').iterdir())
+          print('shipped:', shipped)
+          print('forbidden present:', present)
+          try:
+              import tkinter
+              print('tkinter is importable, which it should not be')
+              present.append('tkinter')
+          except ImportError:
+              pass
+          sys.exit(1 if present else 0)"
+
+      - name: The offline service suite passes inside the image
+        run: |
+          docker run --rm -v "$PWD/tests:/app/tests:ro" \
+            --entrypoint python kramer-vs44:ci tests/test_server_offline.py
+
+      - name: It serves, reports an absent matrix, and reports healthy
+        run: |
+          # 203.0.113.1 is reserved for documentation and never routed, so the
+          # matrix is guaranteed unreachable: exactly the state the healthcheck
+          # must still call healthy.
+          docker run -d --name smoke -p 18000:8000 \
+            -e KRAMER_MATRIX=203.0.113.1 -e TZ=Europe/Rome kramer-vs44:ci
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:18000/api/state >/dev/null && break || sleep 1
+          done
+          curl -fsS http://127.0.0.1:18000/api/state | tee /dev/stderr \
+            | grep -q '"connected": false'
+          curl -fsS http://127.0.0.1:18000/ | grep -q '<title>Kramer VS-44HN</title>'
+          status=starting
+          for _ in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' smoke)
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          echo "health: $status"
+          [ "$status" = healthy ]
+
+      - name: It stops promptly on SIGTERM, without being killed
+        run: |
+          # Without a SIGTERM handler Docker would wait out its ten-second grace
+          # period and then kill the process, leaving the matrix believing the
+          # connection is still open - which costs about 90 seconds before a
+          # restarted container can reconnect. Stopping in a couple of seconds is
+          # the evidence that the handler ran.
+          start=$(date +%s)
+          docker stop smoke
+          echo "stopped in $(( $(date +%s) - start ))s"
+          [ $(( $(date +%s) - start )) -lt 8 ]
+          docker logs smoke 2>&1 | tail -n 5
+          docker logs smoke 2>&1 | grep -q "stopping"
+          docker rm -f smoke
+
+      # ---- publish, tags only ------------------------------------------------
+      - name: Log in to ghcr.io
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/metadata-action@v5
+        with:
+          # metadata-action lowercases the name for us: the owner is "Piero-93"
+          # and an uppercase letter is not a legal image reference.
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Push
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

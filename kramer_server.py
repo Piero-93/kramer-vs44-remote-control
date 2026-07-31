@@ -53,6 +53,7 @@ import json
 import os
 import queue
 import re
+import signal
 import socket
 import threading
 import time
@@ -605,8 +606,11 @@ class Handler(BaseHTTPRequestHandler):
         service was started with --allow-preset-store. The confirmation in the
         page is a courtesy; this is the actual gate."""
         if not self.server.allow_preset_store:
+            # Name the environment variable too: in a container there is no shell
+            # to restart the service in, and the remedy is a redeploy.
             return self._error(403, "storing presets is disabled: restart the "
-                                    "service with --allow-preset-store")
+                                    "service with --allow-preset-store, or set "
+                                    "KRAMER_ALLOW_PRESET_STORE=1")
         if not 1 <= n <= N_PRESETS:
             return self._error(400, f"preset must be between 1 and {N_PRESETS}")
         link = self.server.link
@@ -752,9 +756,16 @@ def main():
         log(f"WARNING: {INDEX} is missing, the API works but / will fail")
     link.start()
 
-    shown = args.host if args.host != "0.0.0.0" else _local_address()
     log(f"kramer-vs44 {kp.VERSION}")
-    log(f"serving http://{shown}:{args.port}/  (matrix {link.detail})")
+    if in_container():
+        # A container's own address is not reachable from the network, so
+        # printing a URL built from it would be a confident lie. The host decides
+        # what the address is, through its published port.
+        log(f"listening on {args.host}:{args.port} - reach it at the host's "
+            f"address and published port  (matrix {link.detail})")
+    else:
+        shown = args.host if args.host != "0.0.0.0" else _local_address()
+        log(f"serving http://{shown}:{args.port}/  (matrix {link.detail})")
     # Naming the resolved file turns every future "where did my names go" into a
     # line someone can read, instead of an investigation.
     log(f"settings file: {CONFIG_PATH}")
@@ -770,6 +781,15 @@ def main():
         log("liveness checking is disabled: a matrix switched off silently will "
             "still be reported as connected")
     log("run only one controller at a time - see the README")
+
+    # A container is stopped with SIGTERM, whose default disposition kills the
+    # process outright: the finally below would never run and the socket to the
+    # matrix would stay open as far as the matrix is concerned. Measured
+    # consequence: it then refuses a new connection for about 90 seconds, so
+    # every redeploy would begin with a minute and a half of "not connected".
+    # Raising KeyboardInterrupt reuses the clean shutdown that already exists.
+    install_stop_signals()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -779,6 +799,31 @@ def main():
         server.server_close()
         link.stop()
     return 0
+
+
+def in_container():
+    """Whether this process is running inside a container.
+
+    Only used to keep the startup message honest, so best effort is enough:
+    /.dockerenv is what Docker itself creates, and the environment variable is
+    set by this project's own image so another runtime can be told explicitly."""
+    return kp.env_flag("KRAMER_IN_CONTAINER") or Path("/.dockerenv").exists()
+
+
+def stop_on_signal(signum, _frame):
+    """Turn a stop signal into the KeyboardInterrupt that main() already handles,
+    so there is one shutdown path rather than two."""
+    log(f"signal {signum} received, stopping")
+    raise KeyboardInterrupt
+
+
+def install_stop_signals():
+    """SIGTERM is what a container runtime sends. SIGINT is already handled by
+    Python raising KeyboardInterrupt, so it needs nothing. Guarded because
+    signal.SIGTERM does not exist everywhere, and signal handlers can only be
+    installed from the main thread - which is where main() runs."""
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, stop_on_signal)
 
 
 def _config_writable():

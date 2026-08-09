@@ -387,6 +387,19 @@ def parse_vid_reply(text):
     return {int(o): int(i) for o, i in pairs}
 
 
+def preset_flags(proto, slots):
+    """Which of `slots` already hold a layout, as {n: bool|None}.
+
+    Protocol 2000 answers this per slot with instruction 15; Protocol 3000 has
+    no per-slot equivalent, so callers get None and the UI stays silent about
+    occupancy rather than guessing. Runs on the worker thread: one command per
+    slot, spaced by the transport's own rate limit."""
+    probe = getattr(proto, "preset_defined", None)
+    if probe is None:
+        return None
+    return {n: probe(n) for n in slots}
+
+
 # --------------------------------------------------------------------------- #
 # UI
 # --------------------------------------------------------------------------- #
@@ -563,10 +576,14 @@ class App:
         f = ttk.LabelFrame(self.root, text="Presets", padding=8)
         f.pack(fill="x", padx=10, pady=4)
         self.preset_labels = []
+        self.preset_marks = []
         for n in range(1, self.N_PRESETS + 1):
             r, c = divmod(n - 1, 4)
             box = ttk.Frame(f)
             box.grid(row=r, column=c, padx=4, pady=3, sticky="w")
+            mark = tk.StringVar(value="")
+            ttk.Label(box, textvariable=mark, width=2).pack(side="left")
+            self.preset_marks.append(mark)
             v = tk.StringVar(value=self.cfg["presets"][n - 1])
             ttk.Entry(box, textvariable=v, width=14).pack(side="left")
             self.preset_labels.append(v)
@@ -696,6 +713,12 @@ class App:
             else:
                 self._write_log(f"== connected, {res['detail']}")
             self._refresh()
+            # Occupancy is queued behind the routing read on purpose: it is 8
+            # commands, and the grid is what the user is waiting for. The marks
+            # fill in a second or so later without holding anything up.
+            self.worker.submit(
+                "preset_flags",
+                lambda w: preset_flags(w.proto, range(1, self.N_PRESETS + 1)))
             self._schedule_autorefresh()
         elif tag == "link_down":
             if res["retrying"]:
@@ -708,6 +731,16 @@ class App:
             self._apply_status(res)
         elif tag == "status_auto":
             self._apply_status(res, quiet=True)
+        elif tag == "preset_flags":
+            self._apply_preset_flags(res)
+        elif tag == "preset_ask":
+            n, flags = res
+            self._apply_preset_flags(flags)
+            self._confirm_store(n, (flags or {}).get(n))
+        elif tag == "preset_stored":
+            n, flags = res
+            self._write_log(f"   preset {n} stored")
+            self._apply_preset_flags(flags)
         elif tag == "notify":
             self._apply_notifications(res)
         elif tag == "info":
@@ -751,9 +784,12 @@ class App:
         A greyed-out radio button still reads as *set*, and the front panel can
         move things while the link is down. Silent staleness is the worst failure
         a control panel can have, so the marks go away entirely; reconnecting
-        re-reads the state and fills them back in within about a second."""
+        re-reads the state and fills them back in within about a second. Preset
+        occupancy goes with it, for the same reason."""
         for v in self.route_vars.values():
             v.set(-1)
+        for m in self.preset_marks:
+            m.set("")
 
     def _render_link(self):
         """The connection indicator, redrawn from link_state.
@@ -958,16 +994,44 @@ class App:
         self.root.after(900, self._refresh)
 
     def _preset_store(self, n):
+        """Read the slot before asking, rather than trusting the cached mark.
+
+        The dialog is the last thing standing between a mis-click and a lost
+        layout, so what it says has to be true at that moment: the front panel
+        can have filled the slot since the marks were read. One command, and it
+        buys a warning that only appears when there is something to lose."""
         if not self.connected:
             return
+        self.worker.submit("preset_ask",
+                           lambda w: (n, preset_flags(w.proto, [n])))
+
+    def _confirm_store(self, n, defined):
         name = self.preset_labels[n - 1].get()
+        if defined is None:
+            detail = "Could not tell whether this slot is in use."
+        elif defined:
+            detail = "It already holds a layout, which will be lost."
+        else:
+            detail = "The slot is empty."
         if not messagebox.askyesno(
-                "Overwrite the preset?",
-                f"Store the current routing into preset {n} ({name})?\n"
-                "The previous content will be lost."):
+                "Store the preset?",
+                f"Store the current routing into preset {n} ({name})?\n{detail}"):
             return
         self._write_log(f"-> storing preset {n}")
-        self.worker.submit("preset", lambda w: w.proto.preset_store(n))
+
+        def job(w):
+            w.proto.preset_store(n)
+            return (n, preset_flags(w.proto, [n]))
+        self.worker.submit("preset_stored", job)
+
+    def _apply_preset_flags(self, flags):
+        """A slot whose state could not be read keeps the mark it had: blanking
+        it would claim the slot is empty, which is the one thing worth being
+        sure about here."""
+        for n, defined in (flags or {}).items():
+            if defined is None:
+                continue
+            self.preset_marks[n - 1].set("●" if defined else "")
 
     def _device_info(self):
         if not self.connected:

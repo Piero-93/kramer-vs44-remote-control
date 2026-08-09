@@ -355,7 +355,7 @@ class Protocol2000:
 class Protocol3000:
     name = "Protocol 3000"
 
-    QUERIES = ("MODEL?", "VERSION?", "SN?", "BUILDDATE?", "PROT-VER?",
+    QUERIES = ("MODEL?", "VERSION?", "SN?", "BUILD-DATE?", "PROT-VER?",
                "INFO-IO?", "INFO-PRST?", "LOCK-FP?")
 
     def __init__(self, transport, machine=1):
@@ -386,7 +386,12 @@ class Protocol3000:
         return r
 
     def status(self):
-        return self.cmd("VID?")
+        """A bare #VID? is refused with ERR001: the query wants a target, and
+        '*' is the one that answers for every output at once. Verified on a
+        VS-44HN, firmware 3.3:
+            #VID? *  ->  ~01@VID 1>1, 2>2, 0>3, 1>4
+        Input 0 means the output is disconnected."""
+        return self.cmd("VID? *")
 
     def preset_store(self, n):
         return self.cmd(f"PRST-STO {n}")
@@ -395,14 +400,24 @@ class Protocol3000:
         return self.cmd(f"PRST-RCL {n}")
 
     def presets(self):
+        """PRST-LST? lists the slots that hold a layout ('1,4,8'). PRST-VID? is
+        listed by the device's own HELP but answers ERR001 in every form tried -
+        bare, per slot, and '*' - so on firmware 3.3 the stored routing cannot be
+        read back. It is still asked here: the reply is the evidence, and another
+        firmware may well answer it."""
         return {"PRST-LST?": self.cmd("PRST-LST?"),
                 "PRST-VID?": self.cmd("PRST-VID?")}
 
-    def signal(self, inp=None):
-        return self.cmd("SIGNAL?" if inp is None else f"SIGNAL? {inp}")
+    def signal(self, inp):
+        """One input per command. The device refuses both #SIGNAL? and
+        #SIGNAL? * with ERR001, so there is no all-at-once form to fall back
+        on. Reply: '~01@SIGNAL 1, 0' - input 1, no signal."""
+        return self.cmd(f"SIGNAL? {inp}")
 
-    def display(self):
-        return self.cmd("DISPLAY?")
+    def display(self, out):
+        """Per output, for the same reason signal() is per input: the bare
+        #DISPLAY? and #DISPLAY? * are both refused with ERR001."""
+        return self.cmd(f"DISPLAY? {out}")
 
     def identify_visual(self):
         return self.cmd("IDV")

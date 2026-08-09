@@ -716,9 +716,17 @@ class App:
             # Occupancy is queued behind the routing read on purpose: it is 8
             # commands, and the grid is what the user is waiting for. The marks
             # fill in a second or so later without holding anything up.
-            self.worker.submit(
-                "preset_flags",
-                lambda w: preset_flags(w.proto, range(1, self.N_PRESETS + 1)))
+            def flags_job(w):
+                # Muted for the same reason the automatic refresh is: nobody
+                # asked for these eight commands, and sixteen lines of hexdump
+                # would bury the connection message right above them.
+                w.transport.set_muted(True)
+                try:
+                    return preset_flags(w.proto, range(1, self.N_PRESETS + 1))
+                finally:
+                    w.transport.set_muted(False)
+
+            self.worker.submit("preset_flags", flags_job)
             self._schedule_autorefresh()
         elif tag == "link_down":
             if res["retrying"]:

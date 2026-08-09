@@ -1052,8 +1052,8 @@ class App:
         self._write_log("-> signal presence on the inputs")
 
         def job(w):
-            if isinstance(w.proto, kv.Protocol3000):
-                return {"SIGNAL?": w.proto.signal()}
+            # Both protocols answer one input at a time: Protocol 3000 refuses
+            # #SIGNAL? without an input just as Protocol 2000 has no such form.
             return {self.in_labels[i - 1].get(): w.proto.signal(i)
                     for i in range(1, self.N_IO + 1)}
 

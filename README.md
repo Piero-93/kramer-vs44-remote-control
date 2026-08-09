@@ -851,12 +851,13 @@ Maximum 64 characters per string. Commands can be concatenated with `|`.
 |---|---|
 | `#` | handshake, replies `~01@OK` |
 | `#VID1>1` | route input 1 to output 1 |
-| `#VID?` | routing status |
+| `#VID? *` | routing status — see the note below, the bare form is refused |
 | `#PRST-STO n` / `#PRST-RCL n` | store / recall preset |
-| `#PRST-LST?` / `#PRST-VID?` | stored presets / their content |
-| `#MODEL?` `#VERSION?` `#SN?` `#BUILDDATE?` `#PROT-VER?` | identification |
+| `#PRST-LST?` | which preset slots hold a layout, e.g. `~01@PRST-LST 1,4,8` |
+| `#PRST-VID?` | preset contents — **refused in every form on firmware 3.3** |
+| `#MODEL?` `#VERSION?` `#SN?` `#BUILD-DATE?` `#PROT-VER?` | identification |
 | `#INFO-IO?` / `#INFO-PRST?` | I/O count / preset count |
-| `#SIGNAL?` / `#DISPLAY?` | valid input / valid output |
+| `#SIGNAL? <in>` / `#DISPLAY? <out>` | valid input / valid output, one at a time |
 | `#LOCK-FP 0\|1` / `#LOCK-FP?` | front-panel lock |
 | `#IDV` | visual identification (blinks) |
 | `#HELP` | list supported commands |
@@ -866,6 +867,25 @@ Maximum 64 characters per string. Commands can be concatenated with `|`.
 | `#FACTORY` | **DESTRUCTIVE** — wipes the entire configuration |
 
 25 commands in total. **No network commands.**
+
+**Queries need a target, and the manual does not say so.** Measured on a VS-44HN (firmware 3.3,
+protocol 3000:1.08) by asking the device itself with `#HELP` and then trying each form:
+
+| Sent | Reply |
+|---|---|
+| `#VID?` | `~01@VID ERR001` |
+| `#VID? *` | `~01@VID 1>1, 2>2, 0>3, 1>4` |
+| `#VID? 4` | `~01@VID 1>4` |
+| `#SIGNAL?` and `#SIGNAL? *` | `~01@SIGNAL ERR001` |
+| `#SIGNAL? 1` | `~01@SIGNAL 1, 0` |
+| `#DISPLAY?` and `#DISPLAY? *` | `~01@DISPLAY ERR001` |
+| `#DISPLAY? 1` | `~01@DISPLAY 1, 1` |
+| `#BUILDDATE?` | `~01@ERR002` (no such command) |
+| `#BUILD-DATE?` | `~01@BUILD-DATE 2015/03/24 10:13:02` |
+| `#PRST-VID?`, `#PRST-VID? 1`, `#PRST-VID? *` | `~01@PRST-VID ERR001` — listed by `#HELP`, never answered |
+
+So `*` works for `#VID?` and for nothing else, and `#PRST-VID?` cannot be made to answer at all:
+on this firmware a preset's contents cannot be read back from the device.
 
 ### Constants in the code
 
@@ -990,15 +1010,16 @@ These are deliberate choices, not accidents.
   connection — the only way both interfaces could run at once without either going stale.
 - **Serial transport and Protocol 3000 in the web service**, neither wired up today.
 - **Preset contents in the UI**: store the routing snapshot locally so each preset shows what it
-  actually does (`#PRST-VID?` can read it back from the device on Protocol 3000).
+  actually does. There is no way to read it back from the device: `#PRST-VID?` is refused on
+  firmware 3.3 (see above), and Protocol 2000 has no equivalent, so a local snapshot would miss
+  anything saved from the front panel.
 
 ## Contributing
 
 Issues and pull requests are welcome, especially:
 
-- confirmation or correction of the byte sequences marked as unverified above;
 - results on a **VS-44H** or on other Protocol 2000 Kramer matrices;
-- the actual reply format of `#VID?` on real firmware.
+- a firmware where `#PRST-VID?` actually answers, or the form that makes it answer on 3.3.
 
 When reporting protocol behaviour, please include the output of the relevant command with `-v`
 so the raw bytes are visible.

@@ -363,6 +363,13 @@ The window offers a connection bar (network or serial, with protocol selection),
 with one radio-button row per output, the 8 presets with recall/store buttons, a few utility
 actions, and a log panel showing every byte sent and received.
 
+Every preset that already holds a layout is marked with a dot (**●**), read from the device after
+connecting and refreshed after each store. **Store** asks first, and the question is answered
+against the slot as it is at that moment — not against the marks, which the front panel can have
+made stale — so it says whether the slot is empty or about to lose what it holds. On Protocol 3000
+there is no per-slot query, so the marks stay blank and the confirmation says the state could not
+be read. Recalling is never guarded: it is not destructive.
+
 Input, output and preset **labels are editable** and persisted, so the grid can read
 "Desktop → Left monitor" instead of "IN 1 → OUT 1". Settings are written when the window closes, to
 the same file the web service uses and resolved the same way — see

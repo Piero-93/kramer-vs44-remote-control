@@ -26,8 +26,8 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 > **Status.** Verified against the official VS-44HN manual (P/N 2900-300161 Rev 8) and exercised
 > on real hardware over LAN: a VS-44HN running firmware **3.3**, reporting 4 inputs, 4 outputs
 > and 8 presets. Should also work on the **VS-44H**, which shares the protocol, but that model
-> has not been tested. One byte sequence is still derived from the bit layout rather than
-> observed — it is marked as such in [Protocol reference](#protocol-reference).
+> has not been tested. Every byte sequence in [Protocol reference](#protocol-reference) has now
+> been observed on the device rather than derived from the bit layout.
 
 ---
 
@@ -799,8 +799,10 @@ Replies come back in the same 4-byte format with the DESTINATION bit set (`0x40`
 (instruction 15, is preset *n* defined → the OUTPUT field of the reply is 1 for an occupied slot and
 0 for an empty one, cross-checked against a unit with exactly one preset saved).
 
-**Still derived from the bit layout only** — verify with `-v` before relying on it:
-`1E 81 80 81` (front-panel lock).
+`1E 81 80 81` (front-panel lock) was the last sequence still derived from the bit layout alone.
+It is now confirmed too: it replies `5E 81 80 81`, after which instruction 31 reports the panel
+locked, and `1E 80 80 81` releases it. Every sequence in the table above has now been run on the
+hardware.
 
 > **`status` semantics on Protocol 2000: resolved.** NOTE 4 of the manual, describing the OUTPUT
 > field of the reply, is ambiguously worded, so it was checked on hardware. The OUTPUT field of
@@ -982,12 +984,11 @@ These are deliberate choices, not accidents.
 
 ## Known limitations
 
-- **The reply format of `#VID?` is an assumption.** The manual documents the *command* as
-  `#VID<in>><out>` but never documents the reply to the query. `parse_vid_reply()` assumes the
-  same direction, isolated in the `VID_REPLY_IS_IN_TO_OUT` constant in `kramer_gui.py`. To
-  verify: route input 1 to output 4 only, then click *Refresh state*. If the mark appears on
-  (out 4, in 1) the assumption holds; if it appears on (out 1, in 4), set the constant to
-  `False`.
+- ~~**The reply format of `#VID?` is an assumption.**~~ **Confirmed on hardware.** The manual
+  documents the *command* as `#VID<in>><out>` and never documents the reply, so the same
+  direction was assumed. Measured by routing input 1 to output 4 and reading back
+  `~01@VID 1>1, 2>2, 0>3, 1>4`: the reply is `in>out`, so `VID_REPLY_IS_IN_TO_OUT = True` in
+  `kramer_gui.py` is correct. A disconnected output appears as `0>n`.
 - **Two controllers cannot both stay in sync, and neither is told so.** The device announces a
   front-panel press to one connected client only, and never announces a command issued by another
   client. Whichever controller loses shows stale routing with no error — hence one at a time.

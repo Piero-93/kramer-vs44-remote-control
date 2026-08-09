@@ -365,13 +365,13 @@ class Worker(threading.Thread):
 # Reply parsing
 # --------------------------------------------------------------------------- #
 
-# The VS-44HN manual documents the COMMAND as #VID<in>><out>, but it does NOT
-# document the reply format of #VID?. The same direction, in>out, is assumed
-# here. If the grid comes out transposed, just set this to False.
-#
-# How to check it in 10 seconds: route input 1 to output 4 ONLY, then press
-# "Refresh state". If the mark shows up on (in 1, out 4) the assumption holds;
-# if it shows up on (in 4, out 1) it is inverted.
+# The VS-44HN manual documents the COMMAND as #VID<in>><out> but never documents
+# the reply to #VID?, so the same direction was assumed here. Confirmed on a
+# VS-44HN, firmware 3.3: with input 1 routed to output 4 and output 3 left
+# disconnected, the device answers
+#     ~01@VID 1>1, 2>2, 0>3, 1>4
+# which is in>out, and 0 for an input means the output is disconnected. Kept as a
+# constant because another model may well answer the other way round.
 VID_REPLY_IS_IN_TO_OUT = True
 
 

@@ -25,6 +25,15 @@ from tempfile import mkdtemp
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import kramer_gui as g
 
+# The report prints UI strings verbatim, and the window is not restricted to
+# what a Windows console can encode: the connection indicator's bullet alone
+# aborts the whole run on cp1252, after the checks have already passed. Only
+# the printing is at stake, so widen the output rather than keep every checked
+# string to ASCII - the alternative is a suite that cannot be run where it is
+# developed without setting an environment variable first.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # Never touch the real configuration file.
 g.CONFIG_PATH = Path(mkdtemp()) / "kramer_gui_config.json"
 

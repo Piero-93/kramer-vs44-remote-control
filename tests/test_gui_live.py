@@ -96,6 +96,12 @@ landed = pump(30, until=lambda: "status" in seen)
 check("initial state read completes", landed, True)
 notes.append(f"a full state read took {time.monotonic() - started:.1f} s")
 
+# Connecting queues a second job behind the refresh - the eight preset occupancy
+# reads. Everything below measures what the log does during one specific read, so
+# it has to start from a device that is no longer busy with the previous ones.
+check("connect-time preset read completes",
+      pump(30, until=lambda: "preset_flags" in seen), True)
+
 routing = {o: v.get() for o, v in app.route_vars.items()}
 check("grid populated by the initial read", all(v >= 0 for v in routing.values()), True)
 notes.append(f"routing read from the device: {routing}")

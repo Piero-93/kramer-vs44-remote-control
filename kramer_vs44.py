@@ -50,6 +50,7 @@ Examples
 
 import argparse
 import ipaddress
+import re
 import socket
 import sys
 import time
@@ -424,6 +425,22 @@ class Protocol3000:
 
     def lock_front_panel(self, locked=True):
         return self.cmd(f"LOCK-FP {1 if locked else 0}")
+
+    def is_locked(self):
+        """True when the front panel is locked, None when the reply is not
+        understood.
+
+        Unlike every other sequence in this file, the *shape* of this particular
+        reply has not been observed: the command is in the device's own query
+        list and the parse follows the convention every measured Protocol 3000
+        reply uses ('~01@LOCK-FP 1'), but nobody has seen this one come back. So
+        it returns None rather than a guess when it does not match, and each
+        caller is expected to say "unknown" instead of "unlocked" - the two are
+        not the same thing when the answer decides whether someone standing at
+        the machine can use its buttons."""
+        reply = self.cmd("LOCK-FP?")
+        m = re.search(r"LOCK-FP\s+([01])\b", reply or "")
+        return bool(int(m.group(1))) if m else None
 
     def device_info(self):
         """NOTE: the VS-44HN exposes no network command at all (no NET-IP?).

@@ -50,6 +50,13 @@ services:
       # operation this service exposes, which is why it is off by default.
       # KRAMER_ALLOW_PRESET_STORE: "1"
 
+      # Lets the page lock the front panel, which stops the buttons on the
+      # machine itself from working. Off by default for a reason worth reading:
+      # if you lock the panel and this container later cannot be reached, the
+      # person standing at the matrix has no way to control it. Unlocking never
+      # needs this variable, so a panel left locked can always be released.
+      # KRAMER_ALLOW_PANEL_LOCK: "1"
+
       # Leave KRAMER_HOST alone in a container: it is this service's listen
       # address, exposure is decided by "ports" above, and the healthcheck
       # probes 127.0.0.1 - so narrowing it would only paint the app red.

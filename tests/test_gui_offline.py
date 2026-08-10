@@ -453,8 +453,8 @@ check("the indicator shows the link", app.status.cget("text"),
 check("green again", colour_of(app.status), "#2a7")
 check("the outage length is logged",
       "reconnected after 92s" in app.log.get("1.0", "end"), True)
-check("and the routing is read again immediately, occupancy behind it",
-      submitted, ["status", "preset_flags"])
+check("and the routing is read again immediately, the rest behind it",
+      submitted, ["status", "preset_flags", "lock_read"])
 
 # A deliberate disconnect is a different thing from a lost link.
 app._handle("link_down", {"reason": "disconnected", "retrying": False}, None)

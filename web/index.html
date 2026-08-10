@@ -130,6 +130,12 @@
     </div>
     <div id="editor" hidden></div>
     <div id="storePanel" hidden></div>
+    <div class="row">
+      <span id="lockState"></span>
+      <button id="lockBtn" class="arm" hidden>Lock front panel</button>
+      <button id="unlockBtn" hidden>Unlock front panel</button>
+      <span id="lockHint" class="hint"></span>
+    </div>
   </section>
 
   <footer>Run one controller at a time: the matrix does not report another
@@ -276,11 +282,56 @@ function renderSettings() {
   if (panels.store) renderStorePanel();
 }
 
+// The front panel is the only thing this page reports that somebody standing in
+// another room can touch, so an unknown state is shown as unknown. `locked` is
+// null until the device has answered, and treating that as "unlocked" would be
+// asserting the one fact this control exists to establish.
+function renderLock() {
+  const known = state.connected && state.locked !== null &&
+                state.locked !== undefined;
+  const locked = known && state.locked;
+  const canLock = !!state.allow_panel_lock;
+
+  $("lockState").textContent = !state.connected ? ""
+    : known ? (locked ? "Front panel: LOCKED" : "Front panel: unlocked")
+            : "Front panel: state unknown";
+
+  // Unlock is offered whatever the service was started with. Locking somebody
+  // out of the machine in front of them is the risk; letting them back in is
+  // never one, so the release must not depend on a flag set hours ago.
+  const lockBtn = $("lockBtn"), unlockBtn = $("unlockBtn");
+  lockBtn.hidden = !canLock || !state.connected || locked;
+  unlockBtn.hidden = !state.connected || (known && !locked);
+  lockBtn.disabled = busy;
+  unlockBtn.disabled = busy;
+
+  $("lockHint").textContent = !state.connected ? ""
+    : canLock ? "" : "Locking is disabled on this service; unlocking is not.";
+}
+
+async function setLock(locked) {
+  if (locked && !confirm(
+      "Lock the front panel?\n\n" +
+      "The buttons on the matrix itself stop working until it is unlocked. " +
+      "Anyone standing at the machine will not be able to use it, and the only " +
+      "way back is this page or another controller.")) return;
+  const res = await send("POST", "/api/lock", { locked });
+  if (res) {
+    state = res;
+    renderAll();
+    say(locked ? "Front panel locked." : "Front panel unlocked.");
+  }
+}
+
+$("lockBtn").onclick = () => setLock(true);
+$("unlockBtn").onclick = () => setLock(false);
+
 function renderAll() {
   renderLink();
   renderGrid();
   renderPresets();
   renderSettings();
+  renderLock();
 }
 
 function toast(message) {

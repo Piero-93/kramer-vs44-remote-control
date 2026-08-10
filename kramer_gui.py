@@ -428,6 +428,13 @@ class App:
         self._had_focus = False
         self._last_auto = 0.0
         self._auto_pending = False
+        # Locking the front panel takes the machine away from whoever is standing
+        # in front of it, so it is opt-in. Unlocking never is: a panel left locked
+        # by a session that is now gone has to be releasable by the next one.
+        self.allow_lock = bool(getattr(cli_args, "allow_panel_lock", False))
+        # Widgets that must stay disabled even when the link comes up, because
+        # _set_enabled() otherwise walks the tree and switches every button on.
+        self._never_enable = set()
 
         root.title("Kramer VS-44HN — matrix control")
         root.minsize(720, 640)
@@ -597,12 +604,34 @@ class App:
         f.pack(fill="x", padx=10, pady=4)
         self.util_btns = []
         for text, cmd in (("Device info", self._device_info),
-                          ("Input signal", self._signal),
-                          ("Lock panel", lambda: self._lock(True)),
-                          ("Unlock panel", lambda: self._lock(False))):
+                          ("Input signal", self._signal)):
             b = ttk.Button(f, text=text, command=cmd)
             b.pack(side="left", padx=(0, 6))
             self.util_btns.append(b)
+
+        # Lock is gated, unlock is not. The asymmetry is the point: the risk here
+        # is a panel locked from another room by somebody who then loses the link,
+        # leaving the person at the machine with dead buttons and no way back.
+        self.lock_btn = ttk.Button(f, text="Lock panel",
+                                   command=lambda: self._lock(True))
+        self.lock_btn.pack(side="left", padx=(0, 6))
+        if self.allow_lock:
+            self.util_btns.append(self.lock_btn)
+        else:
+            self.lock_btn.configure(state="disabled")
+            self._never_enable.add(self.lock_btn)
+
+        b = ttk.Button(f, text="Unlock panel", command=lambda: self._lock(False))
+        b.pack(side="left", padx=(0, 6))
+        self.util_btns.append(b)
+
+        # Empty means "not known", which is not the same as unlocked and must not
+        # be drawn as it: the device is only asked on connect and after a change.
+        self.lock_state = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.lock_state).pack(side="left", padx=(2, 0))
+        if not self.allow_lock:
+            ttk.Label(f, text="(locking needs --allow-panel-lock)",
+                      foreground="#666").pack(side="left", padx=(8, 0))
 
         ttk.Label(f, text="Raw command:").pack(side="left", padx=(16, 4))
         self.raw_var = tk.StringVar()
@@ -641,6 +670,8 @@ class App:
 
     def _walk_state(self, widget, state):
         cls = widget.winfo_class()
+        if widget in self._never_enable:
+            return
         if cls in ("TRadiobutton", "TButton") and widget not in (self.connect_btn,):
             try:
                 widget.configure(state=state)
@@ -727,6 +758,17 @@ class App:
                     w.transport.set_muted(False)
 
             self.worker.submit("preset_flags", flags_job)
+
+            def lock_job(w):
+                # One more command, muted with the rest: the panel state is
+                # something the user reads, never something they waited for.
+                w.transport.set_muted(True)
+                try:
+                    return w.proto.is_locked()
+                finally:
+                    w.transport.set_muted(False)
+
+            self.worker.submit("lock_read", lock_job)
             self._schedule_autorefresh()
         elif tag == "link_down":
             if res["retrying"]:
@@ -749,6 +791,10 @@ class App:
             n, flags = res
             self._write_log(f"   preset {n} stored")
             self._apply_preset_flags(flags)
+        elif tag == "lock":
+            self._apply_lock(res)
+        elif tag == "lock_read":
+            self._apply_lock(res, quiet=True)
         elif tag == "notify":
             self._apply_notifications(res)
         elif tag == "info":
@@ -798,6 +844,11 @@ class App:
             v.set(-1)
         for m in self.preset_marks:
             m.set("")
+        # The panel could be locked or unlocked from the front while the link is
+        # down, and this indicator is the one thing here that describes hardware
+        # somebody else can touch. Showing a remembered value would be worse than
+        # showing nothing.
+        self.lock_state.set("")
 
     def _render_link(self):
         """The connection indicator, redrawn from link_state.
@@ -1041,6 +1092,23 @@ class App:
                 continue
             self.preset_marks[n - 1].set("●" if defined else "")
 
+    def _apply_lock(self, locked, quiet=False):
+        """Show the panel state, and say nothing when it is not known.
+
+        None arrives from Protocol 3000, whose reply to LOCK-FP? has never been
+        observed, and from any read that failed. Printing "unlocked" there would
+        be inventing the one fact this control exists to report.
+
+        quiet is the read done on connect: it writes a log line only when the
+        panel turns out to be locked, which is the case worth interrupting for.
+        Announcing "unlocked" on every connection would be noise."""
+        if locked is None:
+            self.lock_state.set("panel: unknown")
+            return
+        self.lock_state.set("panel: LOCKED" if locked else "panel: unlocked")
+        if not quiet or locked:
+            self._write_log(f"   front panel {'locked' if locked else 'unlocked'}")
+
     def _device_info(self):
         if not self.connected:
             return
@@ -1068,10 +1136,26 @@ class App:
         self.worker.submit("info", job)
 
     def _lock(self, locked):
+        """Lock or unlock the front panel, then read back what the device says.
+
+        The read-back is not ceremony. The whole value of this control is that
+        somebody in another room can tell whether the buttons in front of the
+        machine work, and an acknowledgement that a command was sent does not
+        answer that question."""
         if not self.connected:
             return
-        self._write_log(f"-> front panel {'locked' if locked else 'unlocked'}")
-        self.worker.submit("lock", lambda w: w.proto.lock_front_panel(locked))
+        if locked and not self.allow_lock:
+            # The disabled button already prevents this; this is the actual gate,
+            # so a future caller cannot reach it by another path.
+            self._write_log("!! locking is disabled: start with --allow-panel-lock")
+            return
+        self._write_log(f"-> front panel {'lock' if locked else 'unlock'}")
+
+        def job(w):
+            w.proto.lock_front_panel(locked)
+            return w.proto.is_locked()
+
+        self.worker.submit("lock", job)
 
     def _raw(self):
         if not self.connected:
@@ -1135,6 +1219,11 @@ def main():
                          f"{kv.HEARTBEAT:g}; 0 disables the check, and a matrix "
                          f"switched off silently will then keep being reported "
                          f"as connected)")
+    ap.add_argument("--allow-panel-lock", action="store_true",
+                    help="enable the button that locks the front panel. Off by "
+                         "default because it disables the buttons on the machine "
+                         "itself; unlocking never needs this flag, so a panel "
+                         "left locked can always be released")
     kp.add_common_arguments(ap)
     args = ap.parse_args()
     CONFIG_PATH = kp.config_path(args.config)

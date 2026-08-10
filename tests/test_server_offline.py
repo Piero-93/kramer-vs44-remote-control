@@ -43,6 +43,8 @@ class FakeProto:
         self.stores = []
         self.defined = {4}
         self.routing = {1: 1, 2: 2, 3: 0, 4: 0}
+        self.locks = []
+        self.locked = False
 
     def switch(self, inp, out):
         self.switches.append((inp, out))
@@ -62,6 +64,13 @@ class FakeProto:
     def preset_defined(self, n):
         return n in self.defined
 
+    def lock_front_panel(self, locked=True):
+        self.locks.append(locked)
+        self.locked = locked
+
+    def is_locked(self):
+        return self.locked
+
     def status(self):
         return dict(self.routing)
 
@@ -77,6 +86,7 @@ class FakeLink:
         self.detail = "TCP 10.0.0.1:5000"
         self.error = None
         self.fail_with = None
+        self.locked = self.proto.locked
 
     def call(self, fn, timeout=10.0):
         if self.fail_with:
@@ -89,12 +99,16 @@ class FakeLink:
     # than faked away.
     store_preset = ks.DeviceLink.store_preset
     _read_presets = staticmethod(ks.DeviceLink._read_presets)
+    # Borrowed for the same reason: the read-back after the write is the part
+    # worth exercising, and faking it here would test the fake.
+    set_lock = ks.DeviceLink.set_lock
 
     def snapshot(self):
         return {"connected": self.connected, "detail": self.detail,
                 "protocol": self.proto.name if self.connected else None,
                 "routing": {str(o): i for o, i in sorted(self.routing.items())},
                 "presets": {str(n): v for n, v in sorted(self.presets.items())},
+                "locked": self.locked,
                 "error": self.error}
 
 
@@ -222,6 +236,56 @@ link.connected = True
 check("and it never reached the device", link.proto.stores, [2])
 server.allow_preset_store = False
 
+# --- the front-panel lock, and the one-way gate in front of it ------------- #
+# The property being pinned here is the asymmetry, not the plumbing: locking is
+# refused without the flag, unlocking is refused NEVER. A panel locked from a
+# browser by somebody who then walks away leaves whoever is at the machine with
+# dead buttons, and the way back must not depend on how this service was
+# started. If a later change makes the gate symmetrical "for consistency", these
+# are the checks that must go red.
+status, payload = request("GET", "/api/state")
+check("locking is off by default", payload["allow_panel_lock"], False)
+check("and the panel state is reported", payload["locked"], False)
+
+status, payload = request("POST", "/api/lock", {"locked": True})
+check("locking refused with 403", status, 403)
+check("with an actionable message", "--allow-panel-lock" in payload["error"], True)
+check("and nothing reached the device", link.proto.locks, [])
+
+# The gate lets this through even though the flag is off. It fails later, or
+# not at all - but it is never refused here.
+status, payload = request("POST", "/api/lock", {"locked": False})
+check("UNLOCKING is allowed without the flag", status, 200)
+check("and it did reach the device", link.proto.locks, [False])
+
+server.allow_panel_lock = True
+status, payload = request("GET", "/api/state")
+check("the capability is advertised", payload["allow_panel_lock"], True)
+
+status, payload = request("POST", "/api/lock", {"locked": True})
+check("POST /api/lock locks", status, 200)
+check("the device was told", link.proto.locks, [False, True])
+# Read back from the device rather than echoed from the request: the answer to
+# "do the buttons work" has to come from the machine.
+check("and the state comes back locked", payload["locked"], True)
+
+status, payload = request("POST", "/api/lock", {"locked": False})
+check("and unlocks again", payload["locked"], False)
+
+for body, why in (({}, "an empty object"),
+                  ({"locked": "si"}, "a string"),
+                  ({"locked": 1}, "a number"),
+                  ({"locked": None}, "null")):
+    status, payload = request("POST", "/api/lock", body)
+    check(f"{why} is rejected with 400", status, 400)
+check("and none of those reached the device", link.proto.locks, [False, True, False])
+
+link.connected = False
+status, payload = request("POST", "/api/lock", {"locked": False})
+check("unlocking with no link is 503, not 403", status, 503)
+link.connected = True
+server.allow_panel_lock = False
+
 # --- labels ---------------------------------------------------------------- #
 status, payload = request("GET", "/api/labels")
 check("GET /api/labels falls back to defaults", payload["inputs"],
@@ -334,6 +398,13 @@ check("preset storing can be enabled by the environment",
       parse([], KRAMER_ALLOW_PRESET_STORE="1").allow_preset_store, True)
 check("but not enabled by a blank one",
       parse([], KRAMER_ALLOW_PRESET_STORE="").allow_preset_store, False)
+check("panel locking can be enabled by the environment",
+      parse([], KRAMER_ALLOW_PANEL_LOCK="1").allow_panel_lock, True)
+check("a blank variable does not enable it",
+      parse([], KRAMER_ALLOW_PANEL_LOCK="").allow_panel_lock, False)
+check("and it is off when unset", parse([]).allow_panel_lock, False)
+check("the flag turns it on",
+      parse(["--allow-panel-lock"]).allow_panel_lock, True)
 # KRAMER_CONFIG is deliberately NOT an argparse default: config_path() reads it
 # itself, so the same precedence applies to every program without each of them
 # having to remember the variable. The flag stays None unless it is given.

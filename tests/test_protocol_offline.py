@@ -41,7 +41,12 @@ cases = [
     ("STORE PRESET 1", (3, 1, 0), "03 81 80 81"),
     ("RECALL PRESET 1", (4, 1, 0), "04 81 80 81"),
     ("REQUEST STATUS OUTPUT 1", (5, 0, 1), "05 80 81 81"),
+    # Both directions and the read-back, all three measured on hardware in the
+    # session that promoted them from the bit layout. The unlock frame matters
+    # as much as the lock one: it is the way back for whoever is at the machine.
     ("LOCK FRONT PANEL", (30, 1, 0), "1E 81 80 81"),
+    ("UNLOCK FRONT PANEL", (30, 0, 0), "1E 80 80 81"),
+    ("REQUEST PANEL LOCK STATE", (31, 0, 0), "1F 80 80 81"),
     ("IDENTIFY MACHINE", (61, 1, 0), "3D 81 80 81"),
     ("SOFTWARE VERSION", (61, 3, 0), "3D 83 80 81"),
     ("DEFINE MACHINE, output count", (62, 2, 1), "3E 82 81 81"),
@@ -243,6 +248,45 @@ check("a different failure is", m.first_time("no route to host"), True)
 m.mark_ok()
 check("and after a recovery the same one is reported again",
       m.first_time("timed out"), True)
+
+
+# --- the front-panel lock, both protocols ---------------------------------- #
+# This state answers one question: do the buttons on the machine work right now.
+# "Not known" is a third answer, and neither protocol may collapse it into "no".
+
+# Protocol 2000, instruction 31. The reply carries the state in the OUTPUT field,
+# the same field instruction 15 uses for preset occupancy.
+for reply, expected, label in (
+        (bytes([0x5F, 0x80, 0x81, 0x81]), True, "locked"),
+        (bytes([0x5F, 0x80, 0x80, 0x81]), False, "unlocked")):
+    proto = kv.Protocol2000(transport_with([reply]))
+    check(f"P2000 reads the panel as {label}", proto.is_locked(), expected)
+
+# Silence is not "unlocked". A dead-but-open link answers every read with
+# nothing, and reporting that as an unlocked panel would be inventing the one
+# fact the caller asked for.
+proto = kv.Protocol2000(transport_with([None]))
+check("P2000 says unknown when nothing comes back", proto.is_locked(), None)
+
+# Protocol 3000. The command is in the device's own query list, but unlike every
+# other sequence in this file the shape of THIS reply has never been observed -
+# so the parse is deliberately strict and anything unrecognised is None, never
+# False. These cases pin that contract down; they do not claim to know the
+# device, and if hardware ever answers differently this is where it gets fixed.
+for reply, expected, label in (
+        (b"~01@LOCK-FP 1\r\n", True, "locked"),
+        (b"~01@LOCK-FP 0\r\n", False, "unlocked"),
+        (b"LOCK-FP 1\r\n", True, "without the device prefix"),
+        (b"~01@LOCK-FP ERR001\r\n", None, "on an error reply"),
+        (b"~01@OK\r\n", None, "on an unrelated reply"),
+        (b"", None, "on no reply at all")):
+    proto = kv.Protocol3000(transport_with([reply] if reply else [None]))
+    check(f"P3000 lock state {label}", proto.is_locked(), expected)
+
+# A digit that is not 0 or 1 is not a state. Better to say unknown than to treat
+# every non-zero as locked and be wrong in the direction that strands somebody.
+proto = kv.Protocol3000(transport_with([b"~01@LOCK-FP 7\r\n"]))
+check("P3000 rejects a value it does not understand", proto.is_locked(), None)
 
 
 failed = [line for ok, line in results if not ok]

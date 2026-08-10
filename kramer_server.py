@@ -45,6 +45,9 @@ Endpoints
   POST /api/preset/<n>/recall recall preset n, then re-read the routing
   POST /api/preset/<n>/store  overwrite preset n with the current routing;
                               refused with 403 unless --allow-preset-store
+  POST /api/lock              {"locked": true|false} for the front panel;
+                              locking is refused with 403 unless
+                              --allow-panel-lock, unlocking never is
   GET  /api/events            Server-Sent Events: state changes as they happen
 """
 
@@ -148,6 +151,10 @@ class DeviceLink:
         self.on_change = on_change or (lambda: None)
         self.routing = {}           # {output: input}, 0 means disconnected
         self.presets = {}           # {slot: bool}, True when the slot holds a layout
+        # None means "not known", which is not the same as False. Only ever set
+        # from a reply, so a page can show "unknown" instead of claiming the
+        # buttons on the machine work when nobody has asked.
+        self.locked = None
         self.connected = False
         self.detail = f"TCP {host}:{port}"
         self.error = None
@@ -194,6 +201,19 @@ class DeviceLink:
 
         self.presets = self.call(job, timeout=15.0)
 
+    def set_lock(self, locked):
+        """Lock or unlock the front panel and return what the device then says.
+
+        The read-back is the point. An acknowledgement that the command was sent
+        does not tell a browser in another room whether the buttons on the
+        machine currently work, and that is the only question this answers."""
+        def job(proto):
+            proto.lock_front_panel(locked)
+            return proto.is_locked()
+
+        self.locked = self.call(job)
+        return self.locked
+
     def snapshot(self):
         return {
             "connected": self.connected,
@@ -201,6 +221,7 @@ class DeviceLink:
             "protocol": self._proto.name if self._proto else None,
             "routing": {str(o): i for o, i in sorted(self.routing.items())},
             "presets": {str(n): v for n, v in sorted(self.presets.items())},
+            "locked": self.locked,
             "error": self.error,
         }
 
@@ -247,11 +268,17 @@ class DeviceLink:
             # per request. Knowing which slots are occupied is what lets the UI
             # warn before overwriting one.
             self.presets = self._read_presets(proto)
+            # One command. Worth it on every connect rather than per request:
+            # a panel locked by an earlier session looks exactly like a broken
+            # machine to whoever is standing at it, and this is the only place
+            # that can say otherwise.
+            self.locked = proto.is_locked()
             self.connected = True
             self.error = None
             self.monitor.mark_ok()
             log(f"connected to {self.detail} ({proto.name}), routing {self.routing}, "
-                f"presets defined {sorted(n for n, v in self.presets.items() if v)}")
+                f"presets defined {sorted(n for n, v in self.presets.items() if v)}"
+                + (", front panel LOCKED" if self.locked else ""))
             self.on_change()
         except (OSError, ConnectionError) as e:
             self._close()
@@ -494,6 +521,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.partition("?")[0]
         if path == "/api/route":
             return self._do_route()
+        if path == "/api/lock":
+            return self._do_lock()
         recall = PRESET_RECALL.match(path)
         if recall:
             return self._do_preset_recall(int(recall.group(1)))
@@ -598,6 +627,40 @@ class Handler(BaseHTTPRequestHandler):
         self.server.publish_state()
         self._json(200, self.server.state_payload())
 
+    def _do_lock(self):
+        """POST /api/lock with {"locked": true|false}.
+
+        Locking is gated by --allow-panel-lock; unlocking never is. That
+        asymmetry is deliberate and is the whole safety story of this endpoint:
+        the failure worth designing against is a panel locked from a browser by
+        someone who then walks away, leaving whoever is at the machine with dead
+        buttons. Releasing it must never depend on how the service was started."""
+        try:
+            payload = self._read_json()
+            locked = payload.get("locked")
+        except ValueError as e:
+            return self._error(400, str(e))
+        if not isinstance(locked, bool):
+            return self._error(400, 'expected {"locked": true} or {"locked": false}')
+        if locked and not self.server.allow_panel_lock:
+            # Name the environment variable too: in a container there is no shell
+            # to restart the service in, and the remedy is a redeploy.
+            return self._error(403, "locking the front panel is disabled: restart "
+                                    "the service with --allow-panel-lock, or set "
+                                    "KRAMER_ALLOW_PANEL_LOCK=1. Unlocking is "
+                                    "always allowed")
+        try:
+            now = self.server.link.set_lock(locked)
+        except ConnectionError as e:
+            return self._error(503, str(e))
+        except (TimeoutError, OSError) as e:
+            return self._error(504, str(e))
+        log(f"front panel {'locked' if locked else 'unlocked'} by "
+            f"{self.address_string()} (device now reports "
+            f"{'locked' if now else 'unlocked' if now is not None else 'unknown'})")
+        self.server.publish_state()
+        self._json(200, self.server.state_payload())
+
     def _do_preset_store(self, n):
         """The only destructive operation exposed, so it is off unless the
         service was started with --allow-preset-store. The confirmation in the
@@ -664,18 +727,21 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, link, token=None, allow_preset_store=False):
+    def __init__(self, address, link, token=None, allow_preset_store=False,
+                 allow_panel_lock=False):
         super().__init__(address, Handler)
         self.link = link
         self.hub = EventHub()
         self.token = token
         self.allow_preset_store = allow_preset_store
+        self.allow_panel_lock = allow_panel_lock
 
     def state_payload(self):
         """Device state plus what this service permits, so the page can hide a
         function it is not allowed to use instead of offering a dead button."""
         return {**self.link.snapshot(),
-                "allow_preset_store": self.allow_preset_store}
+                "allow_preset_store": self.allow_preset_store,
+                "allow_panel_lock": self.allow_panel_lock}
 
     def publish_state(self):
         self.hub.publish({"type": "state", "state": self.state_payload()})
@@ -719,6 +785,13 @@ def build_parser():
                          "because it is the only destructive operation here (env "
                          "KRAMER_ALLOW_PRESET_STORE=1). Note the flag can only "
                          "turn this on: clear the variable to turn it off")
+    ap.add_argument("--allow-panel-lock", action="store_true",
+                    default=kp.env_flag("KRAMER_ALLOW_PANEL_LOCK"),
+                    help="allow locking the front panel; off by default because "
+                         "it disables the buttons on the machine itself (env "
+                         "KRAMER_ALLOW_PANEL_LOCK=1). Unlocking is always "
+                         "allowed, so a panel left locked can be released "
+                         "whatever this is set to")
     ap.add_argument("--heartbeat", type=float,
                     default=kp.env_default("KRAMER_HEARTBEAT",
                                            str(DeviceLink.HEARTBEAT)),
@@ -740,7 +813,7 @@ def main():
                       args.machine, heartbeat=args.heartbeat)
     try:
         server = Server((args.host, args.port), link, args.token,
-                        args.allow_preset_store)
+                        args.allow_preset_store, args.allow_panel_lock)
     except OSError as e:
         # Almost always the port being taken. A traceback here tells the reader
         # nothing they can act on, and this is the first thing that goes wrong.
@@ -774,6 +847,9 @@ def main():
         log("no token set: anyone on this network can switch the matrix")
     if args.allow_preset_store:
         log("preset storing is ENABLED: the hardware presets can be overwritten")
+    if args.allow_panel_lock:
+        log("front-panel locking is ENABLED: the buttons on the machine can be "
+            "disabled from the browser")
     if not args.heartbeat:
         log("liveness checking is disabled: a matrix switched off silently will "
             "still be reported as connected")

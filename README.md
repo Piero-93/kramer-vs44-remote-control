@@ -354,6 +354,7 @@ python kramer_gui.py
 python kramer_gui.py --host 192.168.1.50 --port 10001
 python kramer_gui.py --serial COM3
 python kramer_gui.py --config /path/to/settings.json
+python kramer_gui.py --allow-panel-lock          # enables the Lock panel button
 ```
 
 Note that here `--host` is the **matrix** address, while `kramer_server.py --host` is the address
@@ -369,6 +370,18 @@ against the slot as it is at that moment — not against the marks, which the fr
 made stale — so it says whether the slot is empty or about to lose what it holds. On Protocol 3000
 there is no per-slot query, so the marks stay blank and the confirmation says the state could not
 be read. Recalling is never guarded: it is not destructive.
+
+The **front-panel lock** is shown next to the utility buttons — *panel: LOCKED*, *panel: unlocked*,
+or *panel: unknown* when the device has not answered, which is what Protocol 3000 reports because
+its reply to `LOCK-FP?` has never been observed. The state is read on connecting and after every
+change, and it is blanked when the link drops, for the same reason the routing grid is: the panel
+can be locked or unlocked from the front while nobody is listening, and a remembered value would be
+worse than none.
+
+**Locking needs `--allow-panel-lock`; unlocking never does.** Without the flag the *Lock panel*
+button stays disabled and says why. The point of the asymmetry is that a locked panel is a machine
+whose own buttons do nothing, and whoever is standing at it must be able to get it back regardless
+of how the program was started.
 
 Input, output and preset **labels are editable** and persisted, so the grid can read
 "Desktop → Left monitor" instead of "IN 1 → OUT 1". Settings are written when the window closes, to
@@ -521,6 +534,7 @@ minute or two.
 | `--port N` | `KRAMER_PORT` | `8000` | HTTP port for this service |
 | `--token STRING` | `KRAMER_TOKEN` | none | require this token on every request |
 | `--allow-preset-store` | `KRAMER_ALLOW_PRESET_STORE` | off | permit overwriting the hardware presets |
+| `--allow-panel-lock` | `KRAMER_ALLOW_PANEL_LOCK` | off | permit **locking** the front panel; unlocking never needs it |
 | `--heartbeat SECONDS` | `KRAMER_HEARTBEAT` | `30` | probe the matrix after this much silence; `0` disables the check |
 | `--config PATH` | `KRAMER_CONFIG` | see below | settings file to use |
 | `--version` | | | print the version and exit |
@@ -553,8 +567,14 @@ These are choices, not oversights:
   from outside, put it behind a VPN.
 - **Run it from a terminal to try it**, or as a container to keep it — see
   [Running it as a service with Docker](#running-it-as-a-service-with-docker).
-- **Front-panel lock, EDID and raw commands are not exposed.** `#FACTORY` deliberately has no
-  endpoint at all, for the same reason it is not a button in the GUI.
+- **EDID and raw commands are not exposed**, and `#FACTORY` deliberately has no endpoint at all,
+  for the same reason it is not a button in the GUI.
+- **The front-panel lock is opt-in, and only in one direction.** Locking needs
+  `--allow-panel-lock`; **unlocking never does**. That asymmetry is the entire safety design of
+  the feature. The failure worth engineering against is not someone locking the panel by mistake,
+  it is a panel locked from a browser by someone who then walks away or loses the network, leaving
+  whoever is standing at the matrix with dead buttons and no way back. Releasing it must never
+  depend on how the service happened to be started, so it does not.
 - **Overwriting presets is off unless you ask for it** — see below.
 
 ### Running it as a service with Docker
@@ -669,16 +689,17 @@ memory and silently lost, because a rename that evaporates on restart is worse t
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "presets", "error", "allow_preset_store"}`; `routing` maps output to input with `0` meaning disconnected, `presets` maps slot to whether it holds a layout |
+| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "presets", "locked", "error", "allow_preset_store", "allow_panel_lock"}`; `routing` maps output to input with `0` meaning disconnected, `presets` maps slot to whether it holds a layout, `locked` is the front panel and is `null` when it has not been read |
 | `GET` | `/api/labels` | input, output and preset names |
 | `PUT` | `/api/labels` | any subset of `inputs`, `outputs`, `presets`; returns the complete set |
 | `POST` | `/api/route` | `{"input": 0-4, "output": 0-4}`; input `0` disconnects, output `0` means every output |
 | `POST` | `/api/preset/<n>/recall` | recalls preset 1-8, then re-reads the routing |
 | `POST` | `/api/preset/<n>/store` | overwrites preset 1-8 with the current routing; `403` unless `--allow-preset-store` |
+| `POST` | `/api/lock` | `{"locked": true|false}` for the front panel; `403` on `true` unless `--allow-panel-lock`, never on `false`. Returns the state, having read the panel back from the device |
 | `GET` | `/api/events` | Server-Sent Events; `{"type": "state"|"labels", ...}` |
 
 Status codes worth knowing: `400` for a malformed or out-of-range request, `403` when preset storing
-is disabled, `500` when the settings file cannot be written, `503` when the matrix is not currently
+or panel locking is disabled, `500` when the settings file cannot be written, `503` when the matrix is not currently
 connected, `504` when it did not answer in time. Note that `500` and `503` mean genuinely different
 things here — the first is a service installed wrong, the second is hardware that is not answering —
 so they are never used interchangeably.
@@ -690,6 +711,7 @@ curl http://localhost:8000/api/state
 curl -X POST http://localhost:8000/api/route -H 'Content-Type: application/json' -d '{"input":2,"output":3}'
 curl -X POST http://localhost:8000/api/preset/1/recall
 curl -X POST http://localhost:8000/api/preset/1/store    # needs --allow-preset-store
+curl -X POST http://localhost:8000/api/lock -H 'Content-Type: application/json' -d '{"locked":false}'
 curl -N http://localhost:8000/api/events
 ```
 

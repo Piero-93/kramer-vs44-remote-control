@@ -453,14 +453,85 @@ check("the indicator shows the link", app.status.cget("text"),
 check("green again", colour_of(app.status), "#2a7")
 check("the outage length is logged",
       "reconnected after 92s" in app.log.get("1.0", "end"), True)
-check("and the routing is read again immediately, occupancy behind it",
-      submitted, ["status", "preset_flags"])
+check("and the routing is read again immediately, the rest behind it",
+      submitted, ["status", "preset_flags", "lock_read"])
 
 # A deliberate disconnect is a different thing from a lost link.
 app._handle("link_down", {"reason": "disconnected", "retrying": False}, None)
 check("a deliberate disconnect goes idle", app.link_state, "idle")
 check("and the button offers to connect", app.connect_btn.cget("text"),
       "Connect")
+
+# --- the front-panel lock indicator ---------------------------------------- #
+# This is the one thing the window reports about hardware a second person can
+# physically touch, so "not known" has to survive as its own answer.
+app._apply_lock(True)
+check("a locked panel is shown as locked", app.lock_state.get(), "panel: LOCKED")
+app._apply_lock(False)
+check("and an unlocked one as unlocked", app.lock_state.get(), "panel: unlocked")
+app._apply_lock(None)
+check("None is unknown, never unlocked", app.lock_state.get(), "panel: unknown")
+
+# The read on connect is muted unless the answer is one the user needs to act
+# on. Announcing "unlocked" on every connection would be noise; announcing
+# "locked" explains why the buttons on the machine are doing nothing.
+app.log.delete("1.0", "end")
+app._apply_lock(False, quiet=True)
+check("a quiet read of an unlocked panel says nothing",
+      app.log.get("1.0", "end").strip(), "")
+app._apply_lock(True, quiet=True)
+check("but a locked one is always logged",
+      "front panel locked" in app.log.get("1.0", "end"), True)
+
+# Same rule as the routing grid: the panel can be locked or unlocked from the
+# front while the link is down, so a remembered value is worse than none.
+app._blank_grid()
+check("losing the link clears the panel state", app.lock_state.get(), "")
+
+# --- the gate on locking, in the window ------------------------------------ #
+# app above was built without the flag, which is the default.
+check("without the flag the lock button is disabled",
+      str(app.lock_btn.cget("state")), "disabled")
+check("and it is not in the list that gets enabled",
+      app.lock_btn in app.util_btns, False)
+# The subtle one. _set_enabled() walks the whole widget tree and switches every
+# button on when the link comes up; without the _never_enable guard that would
+# quietly hand back the button the flag was supposed to withhold.
+app._set_enabled(True)
+check("and a live link does NOT enable it",
+      str(app.lock_btn.cget("state")), "disabled")
+
+# Locking is refused at the method too, not only by the disabled button, so no
+# future caller can reach it by another path.
+app.connected = True
+app.log.delete("1.0", "end")
+submitted.clear()
+app._lock(True)
+check("calling it anyway is refused", submitted, [])
+check("and says why", "--allow-panel-lock" in app.log.get("1.0", "end"), True)
+
+# Unlocking never depends on the flag: it is the way back for whoever is at the
+# machine, and it must work whatever this program was started with.
+app._lock(False)
+check("unlocking is always allowed", submitted, ["lock"])
+app.connected = False
+
+# With the flag, the same button is a normal one.
+second = tk.Toplevel(root)
+allowed = g.App(second, g.load_config(),
+                argparse.Namespace(host=None, port=None, serial=None,
+                                   heartbeat=g.kv.HEARTBEAT,
+                                   allow_panel_lock=True))
+allowed._set_enabled(True)
+check("with the flag the lock button is live",
+      str(allowed.lock_btn.cget("state")), "normal")
+check("and it is enabled with the others",
+      allowed.lock_btn in allowed.util_btns, True)
+allowed.worker.stop()
+# Withdrawn rather than destroyed: App schedules its result-queue drain with
+# after(), and those callbacks outlive destroy() and then fail on widgets that
+# are no longer there. Hiding it costs nothing and keeps the run clean.
+second.withdraw()
 
 # --- config round-trip ---------------------------------------------------- #
 app.autorefresh_secs.set("30")

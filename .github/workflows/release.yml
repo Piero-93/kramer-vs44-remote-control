@@ -14,6 +14,11 @@ jobs:
   tests:
     uses: ./.github/workflows/tests.yml
 
+  # The Arch package is built and installed for real before anything is
+  # published, so a release never ships a recipe that does not work.
+  package:
+    uses: ./.github/workflows/package.yml
+
   build:
     needs: tests
     strategy:
@@ -187,3 +192,90 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --generate-notes \
             out/*
+
+  # ---- the AUR, tags only -------------------------------------------------
+  aur:
+    needs: [package, release]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed openssh git
+
+      # A secret cannot be tested in a job-level `if`, so the guard is here. A
+      # repository without the key configured skips publishing and says so:
+      # failing would turn "the AUR is not set up yet" into a red release, which
+      # is not what it means.
+      - id: gate
+        env:
+          KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$KEY" ]; then
+            echo "AUR_SSH_PRIVATE_KEY is not set - skipping publication."
+            echo "See packaging/aur/README.md for the one-time setup."
+            echo "go=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=yes" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fill in the version and the checksum
+        if: steps.gate.outputs.go == 'yes'
+        run: |
+          set -eux
+          version="${GITHUB_REF_NAME#v}"
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          # Downloaded and hashed here rather than trusted: this is the file the
+          # AUR will tell every user to fetch, so its checksum has to be the one
+          # this workflow actually saw.
+          curl -fsSL "$url" -o /tmp/src.tar.gz
+          sum=$(sha256sum /tmp/src.tar.gz | cut -d' ' -f1)
+          cd packaging/aur
+          sed -i "s#^pkgver=.*#pkgver=${version}#" PKGBUILD
+          sed -i "s#^pkgrel=.*#pkgrel=1#" PKGBUILD
+          sed -i "s#^sha256sums=.*#sha256sums=('${sum}')#" PKGBUILD
+          useradd -m builder && chown -R builder .
+          su builder -c "makepkg --printsrcinfo" > .SRCINFO
+          grep -E '^pkgver=|^sha256sums=' PKGBUILD
+          grep -E '^\s+pkgver|^\s+sha256sums' .SRCINFO
+
+      - name: Push to the AUR
+        if: steps.gate.outputs.go == 'yes'
+        env:
+          KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_KNOWN_HOSTS: ${{ vars.AUR_KNOWN_HOSTS }}
+        run: |
+          set -eu
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          # Trust on first use, and worth being honest about: ssh-keyscan takes
+          # whatever answers, so this authenticates nothing on its own. It is
+          # here to keep StrictHostKeyChecking on for the rest of the session
+          # rather than turning it off.
+          #
+          # To make it a real pin, put the known_hosts line for aur.archlinux.org
+          # into the AUR_KNOWN_HOSTS repository variable - copy it from a machine
+          # that has already verified the host - and this uses it instead.
+          if [ -n "${AUR_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$AUR_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            echo "using the pinned host key"
+          else
+            ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+            echo "no AUR_KNOWN_HOSTS set: trusting the key offered on first contact"
+          fi
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          git config --global user.name "Piero Biagini"
+          git config --global user.email "biagini93@ik.me"
+          git clone ssh://aur@aur.archlinux.org/kramer-vs44-remote-control.git /tmp/aur
+          cp packaging/aur/PKGBUILD packaging/aur/.SRCINFO /tmp/aur/
+          cd /tmp/aur
+          if git diff --quiet; then
+            echo "the AUR already has this content, nothing to push"
+            exit 0
+          fi
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${GITHUB_REF_NAME#v}"
+          git push

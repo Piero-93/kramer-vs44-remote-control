@@ -17,6 +17,14 @@ Dockerfile     text eol=lf
 *.yaml         text eol=lf
 *.sh           text eol=lf
 
+# A PKGBUILD is a bash script that Arch sources, and one carriage return in it
+# produces errors that read as anything but a line-ending problem. .SRCINFO is
+# parsed by the AUR and a .desktop by the desktop environment; neither has any
+# business carrying CRLF just because it was last touched on Windows.
+PKGBUILD       text eol=lf
+.SRCINFO       text eol=lf
+*.desktop      text eol=lf
+
 # Never let line-ending normalisation near these. text=auto does detect binary
 # content and leave it alone, but relying on detection for a file that has to
 # survive byte-for-byte is a bad trade when saying so costs two lines.

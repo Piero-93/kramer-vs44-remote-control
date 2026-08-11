@@ -128,6 +128,25 @@ def ico_bytes(images):
     return header + entries + payloads
 
 
+def svg_bytes():
+    """The same mark as vector, for the desktop icon theme on Linux.
+
+    Not a conversion of the bitmap: the artwork is five rounded rectangles, so
+    the SVG states them directly and is exact at any size. That is what the
+    hicolor theme wants in scalable/, and it means a 512 px launcher icon costs
+    nothing extra."""
+    cells = "\n".join(
+        f'  <rect x="{x}" y="{y}" width="{CELL:g}" height="{CELL:g}" '
+        f'rx="{CELL_RADIUS:g}" fill="#{MARK[0]:02X}{MARK[1]:02X}{MARK[2]:02X}"/>'
+        for x, y in CELLS)
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{CANVAS:g}" '
+        f'height="{CANVAS:g}" viewBox="0 0 {CANVAS:g} {CANVAS:g}">\n'
+        f'  <rect width="{CANVAS:g}" height="{CANVAS:g}" rx="{BG_RADIUS:g}" '
+        f'fill="#{ACCENT[0]:02X}{ACCENT[1]:02X}{ACCENT[2]:02X}"/>\n'
+        f'{cells}\n</svg>\n').encode()
+
+
 def main():
     here = Path(__file__).resolve().parent
     images = []
@@ -143,6 +162,10 @@ def main():
     png = here / "kramer.png"
     png.write_bytes(dict(images)[256])
     print(f"wrote {png}  ({png.stat().st_size} bytes)")
+
+    svg = here / "kramer.svg"
+    svg.write_bytes(svg_bytes())
+    print(f"wrote {svg}  ({svg.stat().st_size} bytes)")
 
 
 if __name__ == "__main__":

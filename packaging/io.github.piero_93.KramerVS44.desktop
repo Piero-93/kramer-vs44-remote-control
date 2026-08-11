@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Kramer VS-44HN Remote Control
+GenericName=HDMI matrix control
+Comment=Route inputs to outputs on a Kramer VS-44HN HDMI matrix switcher
+Exec=kramer-gui
+Icon=io.github.piero_93.KramerVS44
+Terminal=false
+Categories=AudioVideo;Video;Settings;HardwareSettings;
+Keywords=HDMI;matrix;switcher;Kramer;VS-44HN;AV;routing;
+StartupNotify=true
+StartupWMClass=Kramervs44

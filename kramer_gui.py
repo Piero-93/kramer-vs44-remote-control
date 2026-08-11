@@ -1228,7 +1228,15 @@ def main():
     args = ap.parse_args()
     CONFIG_PATH = kp.config_path(args.config)
 
-    root = tk.Tk()
+    # className is what X11 reports as WM_CLASS, and it is how a desktop matches
+    # an open window to its launcher entry: without it Tk says "Tk", which every
+    # other Tk program also says. The .desktop file's StartupWMClass must equal
+    # this exactly.
+    #
+    # "Kramervs44" is already in the form Tk produces, and that is deliberate.
+    # Tk normalises the class - "KramerVS44" comes back as "Kramervs44" - so a
+    # prettier spelling here would silently stop matching the desktop file.
+    root = tk.Tk(className="Kramervs44")
     try:
         root.call("tk", "scaling", 1.2)
     except tk.TclError:

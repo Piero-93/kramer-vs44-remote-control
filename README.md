@@ -119,6 +119,24 @@ way — it goes out as a [container image](#running-it-as-a-service-with-docker)
 project's only third-party dependency real for everyone in order to serve the few. Run from source
 for serial.
 
+### Arch Linux, from the AUR
+
+```bash
+yay -S kramer-vs44-remote-control      # or paru, or makepkg by hand
+```
+
+The **window only**, as a proper system package: `kramer-gui` on the path, an entry in the
+applications menu, and the icon in the theme. It uses the distribution's own `python` and `tk`, so
+nothing is bundled and nothing is compiled. `python-pyserial` is an optional dependency — install it
+and RS-232 works, unlike in the downloadable binary.
+
+The service is deliberately not in this package. It is a long-lived daemon, the container image is
+the right shape for that, and a systemd unit nobody asked for is maintenance without a user.
+
+Settings go to `~/.config/kramer-vs44/`, never into `/usr/lib`. The recipe lives in
+[`packaging/aur/`](packaging/aur/) and is built, installed and linted in CI on every push, so it
+cannot quietly rot between releases.
+
 ### Windows will warn you, and here is why
 
 The executable is **not signed**, so SmartScreen shows *"Windows protected your PC"* on first run:

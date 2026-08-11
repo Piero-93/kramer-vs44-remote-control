@@ -1,0 +1,120 @@
+name: package
+
+# The Arch package, built for real on every push.
+#
+# Same reasoning as the image workflow: makepkg does not exist on the development
+# machine unless somebody happens to keep an Arch around, so CI is the feedback
+# loop that stops this file rotting. It builds from the working tree rather than
+# from a published tarball, which is the only way a change can be checked before
+# the release it would ship in.
+on:
+  push:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  aur:
+    name: arch package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tools
+        run: |
+          pacman -Syu --noconfirm --needed namcap tk python desktop-file-utils git
+
+      # makepkg refuses to run as root, with good reason, and the container is
+      # root. A throwaway user is cheaper than fighting it.
+      - name: A user to build as
+        run: |
+          useradd -m builder
+          chown -R builder .
+
+      - name: The desktop entry is valid
+        run: desktop-file-validate packaging/*.desktop
+
+      - name: Build from this tree, not from a release
+        run: |
+          set -eux
+          version=$(grep -oP '^VERSION\s*=\s*"\K[^"]+' kramer_paths.py)
+          name="kramer-vs44-remote-control-${version}"
+          # Shaped exactly like GitHub's release tarball, so package() sees the
+          # same layout it will see in production.
+          tar --exclude-vcs --exclude=./tests --exclude=./.github \
+              --transform "s|^\./|${name}/|" \
+              -czf "/tmp/${name}.tar.gz" .
+          install -d -o builder /tmp/build
+          cp "/tmp/${name}.tar.gz" packaging/aur/PKGBUILD /tmp/build/
+          cd /tmp/build
+          # pkgver in the committed file is only right for one release, and this
+          # job is checking the recipe rather than that number. Point it at the
+          # local tarball and take the version from the source of truth.
+          sed -i "s#^pkgver=.*#pkgver=${version}#" PKGBUILD
+          sed -i 's#^source=.*#source=("$pkgname-$pkgver.tar.gz")#' PKGBUILD
+          sed -i "s#^sha256sums=.*#sha256sums=('SKIP')#" PKGBUILD
+          chown -R builder /tmp/build
+          su builder -c "makepkg --noconfirm"
+
+      - name: .SRCINFO matches PKGBUILD
+        run: |
+          set -eu
+          cd /tmp/build
+          # Regenerated from the committed PKGBUILD, not from the patched one, so
+          # this compares like with like.
+          cp "$GITHUB_WORKSPACE/packaging/aur/PKGBUILD" ./PKGBUILD.orig
+          mkdir -p check && cp PKGBUILD.orig check/PKGBUILD && chown -R builder check
+          su builder -c "cd check && makepkg --printsrcinfo" > /tmp/SRCINFO.generated
+          if ! diff -u "$GITHUB_WORKSPACE/packaging/aur/.SRCINFO" /tmp/SRCINFO.generated; then
+            echo "::error::.SRCINFO is stale - run: makepkg --printsrcinfo > .SRCINFO"
+            exit 1
+          fi
+          echo ".SRCINFO is in step with PKGBUILD"
+
+      - name: namcap finds no errors
+        run: |
+          set -eu
+          cd /tmp/build
+          namcap PKGBUILD | tee /tmp/lint.txt
+          namcap ./*.pkg.tar.zst | tee -a /tmp/lint.txt
+          # Warnings are expected and are documented in the PKGBUILD; errors are
+          # not. Failing on warnings would mean either silencing real ones later
+          # or carrying an ignore list that nobody maintains.
+          if grep -q " E: " /tmp/lint.txt; then
+            echo "::error::namcap reported an error"
+            exit 1
+          fi
+
+      # What is actually inside matters more than that a file was produced, and
+      # this is the check that would have caught a module left out of package().
+      - name: The package contains what it should, and runs
+        run: |
+          set -eux
+          cd /tmp/build
+          pacman -U --noconfirm ./*.pkg.tar.zst
+          test -x /usr/bin/kramer-gui
+          test -f /usr/lib/kramer-vs44/kramer_gui.py
+          test -f /usr/lib/kramer-vs44/kramer_vs44.py
+          test -f /usr/lib/kramer-vs44/kramer_paths.py
+          test -f /usr/lib/kramer-vs44/packaging/kramer.png
+          test -f /usr/share/applications/io.github.piero_93.KramerVS44.desktop
+          test -f /usr/share/icons/hicolor/scalable/apps/io.github.piero_93.KramerVS44.svg
+          # The launcher answers without a display, which also proves the three
+          # modules resolve each other from /usr/lib.
+          kramer-gui --version | grep -q "kramer-vs44"
+
+      - name: Settings resolve to the user's home, not to /usr/lib
+        run: |
+          # The defect this guards against is silent: a read-only prefix means a
+          # settings file next to the program can never be written, and the whole
+          # point of kramer_paths is that it does not try.
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "/usr/lib/kramer-vs44")
+          import kramer_paths as kp
+          resolved = str(kp.config_path())
+          print("config_path:", resolved)
+          assert "/usr/lib" not in resolved, "settings would land in the install prefix"
+          assert resolved.endswith("kramer_gui_config.json")
+          PY

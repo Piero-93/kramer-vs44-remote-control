@@ -94,14 +94,32 @@ where it would land in your shell history:
 gh secret set AUR_SSH_PRIVATE_KEY --repo Piero-93/kramer-vs44-remote-control < ~/.ssh/aur_ci
 ```
 
-**4. Optional, and worth it: pin the host key.** By default the workflow accepts whatever
-`aur.archlinux.org` offers on first contact, which authenticates nothing. If you have already
-verified that host from your own machine, publish what you verified:
+**4. Pin the host key.** Without this the workflow accepts whatever `aur.archlinux.org` offers on
+first contact, which authenticates nothing — and that step holds a key able to publish under your
+name.
+
+Do not copy a key out of a `known_hosts` file and call it verified: that file usually records what
+was accepted on first contact, so it proves only that nothing has changed since. Check the key
+against what Arch publishes instead. The Ed25519 fingerprint announced on 2020-07-28 in
+[AUR Migration: New SSH HostKeys](https://archlinux.org/news/aur-migration-new-ssh-hostkeys/) is:
+
+```
+SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4
+```
+
+Fetch the key, compare, and only then store it:
 
 ```bash
-gh variable set AUR_KNOWN_HOSTS --repo Piero-93/kramer-vs44-remote-control \
-  --body "$(ssh-keygen -F aur.archlinux.org -f ~/.ssh/known_hosts | grep -v '^#')"
+ssh-keyscan -t ed25519 aur.archlinux.org 2>/dev/null | grep -v '^#' > /tmp/aur_kh
+ssh-keygen -lf /tmp/aur_kh          # must print the fingerprint above
+gh variable set AUR_KNOWN_HOSTS --repo Piero-93/kramer-vs44-remote-control < /tmp/aur_kh
 ```
+
+On PowerShell there is no `<` redirection; pipe instead:
+`Get-Content /tmp/aur_kh -Raw | gh variable set AUR_KNOWN_HOSTS --repo …`
+
+Re-check it if Arch ever announces new host keys: a pin that has gone stale fails the push, which
+is the correct behaviour but reads as a mysterious CI failure unless you know why.
 
 ### Checking it worked
 

@@ -23,7 +23,15 @@ jobs:
 
       - name: Tools
         run: |
-          pacman -Syu --noconfirm --needed namcap tk python desktop-file-utils git
+          # The package's own runtime dependencies are installed too, not just
+          # the build tools: makepkg resolves depends() before it will build, and
+          # it cannot install them itself as an unprivileged user. A development
+          # machine tends to have these already, which is exactly why their
+          # absence has to be handled here rather than discovered on someone
+          # else's.
+          pacman -Syu --noconfirm --needed \
+            namcap git desktop-file-utils \
+            python tk hicolor-icon-theme
 
       # makepkg refuses to run as root, with good reason, and the container is
       # root. A throwaway user is cheaper than fighting it.

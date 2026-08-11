@@ -248,9 +248,19 @@ jobs:
           AUR_KNOWN_HOSTS: ${{ vars.AUR_KNOWN_HOSTS }}
         run: |
           set -eu
-          install -d -m 700 ~/.ssh
-          printf '%s\n' "$KEY" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
+          # Absolute paths throughout, and never a bare ~ inside an ssh option.
+          # ssh does not expand ~ from $HOME; it uses the home directory in the
+          # passwd database. In a container job those differ - GitHub sets
+          # HOME=/github/home while the account is root - so a known_hosts file
+          # the shell writes under ~ lands where ssh will not look, and the
+          # failure reads as "Host key verification failed" with no hint that the
+          # file was written somewhere else entirely. The identity file did work,
+          # because that ~ was expanded by the shell before ssh ever saw it,
+          # which is what made the first attempt so confusing.
+          SSH_DIR="${HOME}/.ssh"
+          install -d -m 700 "$SSH_DIR"
+          printf '%s\n' "$KEY" > "$SSH_DIR/aur"
+          chmod 600 "$SSH_DIR/aur"
           # Trust on first use, and worth being honest about: ssh-keyscan takes
           # whatever answers, so this authenticates nothing on its own. It is
           # here to keep StrictHostKeyChecking on for the rest of the session
@@ -260,13 +270,21 @@ jobs:
           # into the AUR_KNOWN_HOSTS repository variable - copy it from a machine
           # that has already verified the host - and this uses it instead.
           if [ -n "${AUR_KNOWN_HOSTS:-}" ]; then
-            printf '%s\n' "$AUR_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            printf '%s\n' "$AUR_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
             echo "using the pinned host key"
           else
-            ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+            ssh-keyscan -t ed25519 aur.archlinux.org >> "$SSH_DIR/known_hosts"
             echo "no AUR_KNOWN_HOSTS set: trusting the key offered on first contact"
           fi
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
+          # UserKnownHostsFile is named explicitly for the same reason: relying
+          # on ssh's own idea of where ~ points is what broke this once already.
+          SSH_OPTS="-i $SSH_DIR/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$SSH_DIR/known_hosts -o StrictHostKeyChecking=yes"
+          export GIT_SSH_COMMAND="ssh $SSH_OPTS"
+          # Prove the host and the key before touching the repository, so a
+          # failure says which of the two is wrong rather than "could not read
+          # from remote repository". The AUR refuses an interactive shell and
+          # greets you by name, which is exactly the confirmation wanted here.
+          ssh $SSH_OPTS -T aur@aur.archlinux.org || true
           git config --global user.name "Piero Biagini"
           git config --global user.email "biagini93@ik.me"
           git clone ssh://aur@aur.archlinux.org/kramer-vs44-remote-control.git /tmp/aur

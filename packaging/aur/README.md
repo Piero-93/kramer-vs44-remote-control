@@ -71,7 +71,44 @@ pyserial import, one is Tk being loaded rather than linked, and one is `sh`.
 ## Publishing
 
 The AUR is a public channel with an implied promise of maintenance — an abandoned package is worse
-than no package. Publication is automated so that promise costs nothing per release, but it needs
-one secret set up once: an SSH key with write access to the AUR repository, held as
-`AUR_SSH_PRIVATE_KEY` in the GitHub repository's secrets. Without it the release workflow skips the
-step and says so rather than failing.
+than no package. Publication is automated so that promise costs nothing per release. Without the
+secret below the release workflow skips the step and says so, rather than failing.
+
+### One-time setup
+
+**1. A dedicated key, with no passphrase.** Dedicated because the private half goes into GitHub and
+should be revocable on its own; no passphrase because nothing can type one in CI.
+
+```bash
+ssh-keygen -t ed25519 -C "github-actions -> aur" -N "" -f ~/.ssh/aur_ci
+```
+
+**2. Give the AUR the public half.** Log in at <https://aur.archlinux.org>, then *My Account* → *SSH
+Public Key*, and paste the contents of `~/.ssh/aur_ci.pub`. The AUR accepts several keys, so this
+does not disturb the one you already use.
+
+**3. Give GitHub the private half.** Read from the file rather than typing it on a command line,
+where it would land in your shell history:
+
+```bash
+gh secret set AUR_SSH_PRIVATE_KEY --repo Piero-93/kramer-vs44-remote-control < ~/.ssh/aur_ci
+```
+
+**4. Optional, and worth it: pin the host key.** By default the workflow accepts whatever
+`aur.archlinux.org` offers on first contact, which authenticates nothing. If you have already
+verified that host from your own machine, publish what you verified:
+
+```bash
+gh variable set AUR_KNOWN_HOSTS --repo Piero-93/kramer-vs44-remote-control \
+  --body "$(ssh-keygen -F aur.archlinux.org -f ~/.ssh/known_hosts | grep -v '^#')"
+```
+
+### Checking it worked
+
+The first tag after the secret exists publishes the package. The AUR repository does not need to be
+created first: cloning a package that does not exist yet gives an empty repository, and the push
+creates it — but that first run is the one to watch, and the *Push to the AUR* step prints what it
+did either way.
+
+If you ever want it gone: `ssh aur@aur.archlinux.org` offers no delete, so ask on the AUR web
+interface. Removing the GitHub secret stops the automation without touching what is published.

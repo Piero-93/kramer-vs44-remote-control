@@ -245,15 +245,27 @@ jobs:
         if: steps.gate.outputs.go == 'yes'
         env:
           KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_KNOWN_HOSTS: ${{ vars.AUR_KNOWN_HOSTS }}
         run: |
           set -eu
           install -d -m 700 ~/.ssh
           printf '%s\n' "$KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
-          # The AUR host key, pinned rather than accepted blindly: this step has
-          # a key that can publish under someone's name, so it does not get to
-          # trust whatever answers on the other end.
-          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          # Trust on first use, and worth being honest about: ssh-keyscan takes
+          # whatever answers, so this authenticates nothing on its own. It is
+          # here to keep StrictHostKeyChecking on for the rest of the session
+          # rather than turning it off.
+          #
+          # To make it a real pin, put the known_hosts line for aur.archlinux.org
+          # into the AUR_KNOWN_HOSTS repository variable - copy it from a machine
+          # that has already verified the host - and this uses it instead.
+          if [ -n "${AUR_KNOWN_HOSTS:-}" ]; then
+            printf '%s\n' "$AUR_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            echo "using the pinned host key"
+          else
+            ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+            echo "no AUR_KNOWN_HOSTS set: trusting the key offered on first contact"
+          fi
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o IdentitiesOnly=yes"
           git config --global user.name "Piero Biagini"
           git config --global user.email "biagini93@ik.me"

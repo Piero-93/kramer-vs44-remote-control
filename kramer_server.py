@@ -59,6 +59,7 @@ import queue
 import re
 import signal
 import socket
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -877,6 +878,27 @@ class Server(ThreadingHTTPServer):
         self.token = token
         self.allow_preset_changes = allow_preset_changes
         self.allow_panel_lock = allow_panel_lock
+
+    def handle_error(self, request, client_address):
+        """A client that goes away is not an error, and must not be a traceback.
+
+        The default prints twenty lines to stderr, and this container's own
+        health check triggers it every thirty seconds: it reads the answer and
+        exits without closing, so the socket is reset rather than closed and the
+        next read on that keep-alive connection fails. Measured on the NAS,
+        minutes after a restart: two stack traces out of three probes, and forty
+        of the fifty-one log lines were them.
+
+        That matters because the log is the only diagnostic a headless service
+        has. Left alone it grows about 2 MB a day of nothing, and the lines
+        worth having - what it connected to, what the front panel did - rotate
+        out inside a fortnight. Anything that is not a peer disappearing still
+        gets the full traceback, because that would be a real bug."""
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError,
+                              ConnectionAbortedError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
 
     def state_payload(self):
         """Device state plus what this service permits, so the page can hide a

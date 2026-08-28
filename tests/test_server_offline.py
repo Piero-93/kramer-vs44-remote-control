@@ -9,6 +9,8 @@ routes, the validation, the label round-trip, the token gate and the event strea
 can be exercised without hardware. Exits non-zero if any check fails.
 """
 
+import contextlib
+import io as _io
 import json
 import os
 import queue
@@ -403,6 +405,28 @@ status, payload = request("PUT", "/api/labels",
 check("a name is trimmed", payload["presets"][0], "padded")
 status, payload = request("PUT", "/api/labels", {"inputs": ["y" * 100] + ["x"] * 3})
 check("and capped in length", len(payload["inputs"][0]), 40)
+
+# --- a client that goes away is not a traceback ---------------------------- #
+# The container's own health check causes this every thirty seconds: it reads
+# the answer and exits without closing, so the socket is reset and the next read
+# on that keep-alive connection fails. Measured on the NAS minutes after a
+# restart: two stack traces out of three probes, forty of fifty-one log lines.
+# A headless service has only its log, and this buries it - while anything that
+# is NOT a peer disappearing still has to come through, or a real bug goes quiet.
+for error, quiet in ((ConnectionResetError(104, "reset by peer"), True),
+                     (BrokenPipeError(32, "broken pipe"), True),
+                     (ConnectionAbortedError(103, "aborted"), True),
+                     (TimeoutError("timed out"), True),
+                     (ValueError("a real bug"), False)):
+    captured = _io.StringIO()
+    try:
+        raise error
+    except Exception:
+        with contextlib.redirect_stderr(captured):
+            server.handle_error(None, ("127.0.0.1", 40322))
+    name = type(error).__name__
+    check(f"{name} is {'passed over' if quiet else 'still reported'}",
+          captured.getvalue() == "", quiet)
 
 # --- unknown routes -------------------------------------------------------- #
 status, payload = request("GET", "/api/nope")

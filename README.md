@@ -773,6 +773,12 @@ memory and silently lost, because a rename that evaporates on restart is worse t
 | `POST` | `/api/lock` | `{"locked": true|false}` for the front panel; `403` on `true` unless `--allow-panel-lock`, never on `false`. Returns the state, having read the panel back from the device |
 | `GET` | `/api/events` | Server-Sent Events; `{"type": "state"|"labels", ...}` |
 
+A client that hangs up mid-request is not logged as an error. It is normal — a browser tab closing
+on the event stream does it, and so does the container's own health check — and the default
+behaviour is a twenty-line stack trace per occurrence, which for a service that runs for months
+means its log is mostly noise and the lines worth keeping rotate away. Anything that is *not* a peer
+disappearing still gets the full trace.
+
 Status codes worth knowing: `400` for a malformed or out-of-range request, `403` when preset changes
 or panel locking are disabled, `500` when the settings file cannot be written, `503` when the matrix is not currently
 connected, `504` when it did not answer in time. Note that `500` and `503` mean genuinely different

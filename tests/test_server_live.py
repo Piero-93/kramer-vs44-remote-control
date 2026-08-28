@@ -38,11 +38,12 @@ ap.add_argument("--switch-output", type=int, choices=(1, 2, 3, 4), metavar="N",
                 help="also switch this output and restore it (CHANGES THE VIDEO "
                      "on that output for a few seconds)")
 ap.add_argument("--store-preset", type=int, metavar="N",
-                help="also verify storing, using preset slot N. OVERWRITES THAT "
-                     "SLOT permanently: pick an empty one. Requires "
-                     "--switch-output as well, since proving the slot really "
-                     "captured the layout means changing an output and "
-                     "recalling it back")
+                help="also verify storing and emptying, using preset slot N. "
+                     "OVERWRITES THAT SLOT: pick one you do not need. It is "
+                     "emptied again at the end, so a slot that started empty is "
+                     "left as it was found. Requires --switch-output as well, "
+                     "since proving the slot really captured the layout means "
+                     "changing an output and recalling it back")
 args = ap.parse_args()
 if args.store_preset is not None:
     if not 1 <= args.store_preset <= 8:
@@ -73,7 +74,7 @@ def wait_for(predicate, timeout):
 host, _, port = args.matrix.partition(":")
 link = ks.DeviceLink(host, int(port) if port else kv.DEFAULT_TCP_PORT)
 server = ks.Server(("127.0.0.1", 0), link,
-                   allow_preset_store=args.store_preset is not None)
+                   allow_preset_changes=args.store_preset is not None)
 link.on_change = server.publish_state
 base = f"http://127.0.0.1:{server.server_address[1]}"
 threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -86,6 +87,10 @@ if not wait_for(lambda: link.connected, 15):
 notes.append(f"connected and read the routing in {time.monotonic() - started:.1f} s")
 check("the link comes up", link.connected, True)
 check("the protocol is Protocol 2000", link.snapshot()["protocol"], "Protocol 2000")
+# Nothing was watched happening, so no preset can be claimed to be in effect.
+# The routing may well have been set by one, but this connection cannot know it
+# and the device cannot be asked.
+check("no preset is claimed on a fresh connection", link.active_preset, None)
 
 
 def get(path):
@@ -140,6 +145,8 @@ if args.switch_output:
     check("and the switch is pushed to subscribers",
           event["state"]["routing"][str(out)], other)
 
+    check("a switch leaves no preset in effect", state["active_preset"], None)
+
     status, state = post("/api/route", {"input": original, "output": out})
     check(f"output {out} restored to input {original}",
           state["routing"][str(out)], original)
@@ -157,6 +164,8 @@ if args.switch_output:
         status, state = post(f"/api/preset/{slot}/store")
         check(f"POST /api/preset/{slot}/store", status, 200)
         check("the slot now reports as occupied", state["presets"][str(slot)], True)
+        check("and holds exactly what is routed, so it is in effect",
+              state["active_preset"], slot)
         events.get(timeout=10)
 
         post("/api/route", {"input": other, "output": out})
@@ -164,7 +173,25 @@ if args.switch_output:
         status, state = post(f"/api/preset/{slot}/recall")
         check("recalling the slot restores the stored layout",
               state["routing"], routing)
+        check("and names it as the one in effect", state["active_preset"], slot)
         events.get(timeout=10)
+
+        # --- emptying it again, which also puts the machine back ----------- #
+        # A slot that started empty ends the run empty. The routing must not
+        # move: that is the whole difference between emptying a preset and
+        # recalling one, and it is what the confirmation in both UIs promises.
+        before = dict(state["routing"])
+        status, state = post(f"/api/preset/{slot}/delete")
+        check(f"POST /api/preset/{slot}/delete", status, 200)
+        check("the slot reports as empty again", state["presets"][str(slot)], False)
+        check("the outputs did not move", state["routing"], before)
+        check("and nothing is in effect any more", state["active_preset"], None)
+        events.get(timeout=10)
+
+        status, state = post(f"/api/preset/{slot}/delete")
+        check("emptying it twice is accepted", status, 200)
+        check("and it stays empty", state["presets"][str(slot)], False)
+        notes.append(f"preset {slot} was overwritten and then emptied again")
     else:
         notes.append("store check skipped (pass --store-preset N to include it)")
 else:

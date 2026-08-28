@@ -39,6 +39,11 @@ p2 = kv.Protocol2000(kv.Transport(dry_run=True))
 cases = [
     ("SWITCH VIDEO in 2 to out 3", (1, 2, 3), "01 82 83 81"),
     ("STORE PRESET 1", (3, 1, 0), "03 81 80 81"),
+    # Same instruction as the store, and only the OUTPUT field separates them,
+    # which is why this one is pinned by a check rather than left to a comment.
+    # Measured on a VS-44HN, firmware 3.3: it empties that one slot.
+    ("DELETE PRESET 1", (3, 1, 1), "03 81 81 81"),
+    ("DELETE PRESET 8", (3, 8, 1), "03 88 81 81"),
     ("RECALL PRESET 1", (4, 1, 0), "04 81 80 81"),
     ("REQUEST STATUS OUTPUT 1", (5, 0, 1), "05 80 81 81"),
     # Both directions and the read-back, all three measured on hardware in the
@@ -55,6 +60,15 @@ for name, (instr, inp, out), expected in cases:
     check(name, kv.hexdump(p2._frame(instr, inp, out)), expected)
 
 check("CHANGE TO ASCII", kv.hexdump(kv.P2000_TO_P3000), "38 80 83 81")
+
+# Deleting a single preset is a Protocol 2000 command and nothing else here. The
+# device lists no counterpart in its own HELP and none has been tried, so the
+# absence is the interface: callers ask whether the method is there rather than
+# calling one that would have to be guessed at.
+check("Protocol 2000 can empty a slot",
+      callable(getattr(kv.Protocol2000, "preset_delete", None)), True)
+check("Protocol 3000 does not pretend to",
+      getattr(kv.Protocol3000, "preset_delete", None), None)
 check("the machine number lands in byte 4",
       kv.hexdump(kv.Protocol2000(kv.Transport(dry_run=True), machine=5)
                  ._frame(1, 2, 3)), "01 82 83 85")

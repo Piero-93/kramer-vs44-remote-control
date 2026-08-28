@@ -41,6 +41,7 @@ class FakeProto:
         self.switches = []
         self.recalls = []
         self.stores = []
+        self.deletes = []
         self.defined = {4}
         self.routing = {1: 1, 2: 2, 3: 0, 4: 0}
         self.locks = []
@@ -60,6 +61,10 @@ class FakeProto:
     def preset_store(self, n):
         self.stores.append(n)
         self.defined.add(n)
+
+    def preset_delete(self, n):
+        self.deletes.append(n)
+        self.defined.discard(n)
 
     def preset_defined(self, n):
         return n in self.defined
@@ -87,6 +92,7 @@ class FakeLink:
         self.error = None
         self.fail_with = None
         self.locked = self.proto.locked
+        self.active_preset = None
 
     def call(self, fn, timeout=10.0):
         if self.fail_with:
@@ -98,6 +104,7 @@ class FakeLink:
     # Real implementation, borrowed so the occupancy refresh is exercised rather
     # than faked away.
     store_preset = ks.DeviceLink.store_preset
+    delete_preset = ks.DeviceLink.delete_preset
     _read_presets = staticmethod(ks.DeviceLink._read_presets)
     # Borrowed for the same reason: the read-back after the write is the part
     # worth exercising, and faking it here would test the fake.
@@ -108,6 +115,7 @@ class FakeLink:
                 "protocol": self.proto.name if self.connected else None,
                 "routing": {str(o): i for o, i in sorted(self.routing.items())},
                 "presets": {str(n): v for n, v in sorted(self.presets.items())},
+                "active_preset": self.active_preset,
                 "locked": self.locked,
                 "error": self.error}
 
@@ -204,18 +212,24 @@ for n, code in ((0, 400), (9, 400), (99, 400)):
 status, payload = request("GET", "/api/state")
 check("occupied slots are reported", payload["presets"]["4"], True)
 check("empty ones too", payload["presets"]["1"], False)
-check("storing is off by default", payload["allow_preset_store"], False)
+check("preset changes are off by default",
+      payload["allow_preset_changes"], False)
+# Sent under the old name too, so a page loaded before an upgrade keeps working
+# until it is reloaded. It must never disagree with the current one.
+check("and the deprecated key agrees with it",
+      payload["allow_preset_store"], payload["allow_preset_changes"])
 
 # --- storing is refused unless the service was started for it -------------- #
 status, payload = request("POST", "/api/preset/2/store")
 check("store refused with 403", status, 403)
 check("with an actionable message",
-      "--allow-preset-store" in payload["error"], True)
+      "--allow-preset-changes" in payload["error"], True)
 check("and nothing reached the device", link.proto.stores, [])
 
-server.allow_preset_store = True
+server.allow_preset_changes = True
 status, payload = request("GET", "/api/state")
-check("the capability is advertised", payload["allow_preset_store"], True)
+check("the capability is advertised", payload["allow_preset_changes"], True)
+check("under the deprecated key as well", payload["allow_preset_store"], True)
 
 status, payload = request("POST", "/api/preset/2/store")
 check("POST /api/preset/2/store", status, 200)
@@ -234,7 +248,69 @@ status, payload = request("POST", "/api/preset/3/store")
 check("store with no link is 503", status, 503)
 link.connected = True
 check("and it never reached the device", link.proto.stores, [2])
-server.allow_preset_store = False
+server.allow_preset_changes = False
+
+# --- emptying a slot sits behind the same gate as filling one -------------- #
+# One flag answers one question - may this service change what the hardware
+# holds - and a wipe is that same change, not a milder one. This is the check
+# that goes red if someone ever decides a delete is harmless enough to ungate.
+status, payload = request("POST", "/api/preset/4/delete")
+check("delete refused with 403", status, 403)
+check("and names the flag to set",
+      "--allow-preset-changes" in payload["error"], True)
+check("and nothing reached the device", link.proto.deletes, [])
+
+server.allow_preset_changes = True
+status, payload = request("POST", "/api/preset/4/delete")
+check("POST /api/preset/4/delete", status, 200)
+check("the delete reached the device", link.proto.deletes, [4])
+check("and the slot now reads as empty", payload["presets"]["4"], False)
+check("while another occupied slot is untouched", payload["presets"]["2"], True)
+
+status, payload = request("POST", "/api/preset/4/delete")
+check("emptying an empty slot is accepted", status, 200)
+check("and leaves it empty", payload["presets"]["4"], False)
+
+for n in (0, 9, 99):
+    status, payload = request("POST", f"/api/preset/{n}/delete")
+    check(f"delete of preset {n} rejected", status, 400)
+check("and no out-of-range slot reached the device", link.proto.deletes, [4, 4])
+
+link.connected = False
+status, payload = request("POST", "/api/preset/5/delete")
+check("delete with no link is 503, not 403", status, 503)
+link.connected = True
+server.allow_preset_changes = False
+
+# --- which preset the routing came from ------------------------------------ #
+# Only ever set from something this service watched happen. It is never derived
+# by comparing the routing against remembered contents, because the device
+# cannot be asked what a preset holds - so "nothing" here means "not known",
+# which is a different claim from "none of them".
+link.active_preset = None
+status, payload = request("GET", "/api/state")
+check("nothing is claimed before anything is seen",
+      payload["active_preset"], None)
+
+status, payload = request("POST", "/api/preset/3/recall")
+check("a recall names the slot in effect", payload["active_preset"], 3)
+
+status, payload = request("POST", "/api/route", {"input": 1, "output": 2})
+check("and any switch drops it back to not-known",
+      payload["active_preset"], None)
+
+server.allow_preset_changes = True
+status, payload = request("POST", "/api/preset/6/store")
+check("a store puts that slot in effect", payload["active_preset"], 6)
+status, payload = request("POST", "/api/preset/6/delete")
+check("emptying the slot in effect clears it", payload["active_preset"], None)
+
+request("POST", "/api/preset/3/recall")
+status, payload = request("POST", "/api/preset/5/delete")
+check("emptying a different slot leaves it alone",
+      payload["active_preset"], 3)
+server.allow_preset_changes = False
+link.active_preset = None
 
 # --- the front-panel lock, and the one-way gate in front of it ------------- #
 # The property being pinned here is the asymmetry, not the plumbing: locking is
@@ -394,10 +470,35 @@ check("the matrix address comes from the environment too",
       parse([], KRAMER_MATRIX="10.0.0.5:10001").matrix, "10.0.0.5:10001")
 check("so does the token", parse([], KRAMER_TOKEN="abc").token, "abc")
 check("and the heartbeat", parse([], KRAMER_HEARTBEAT="5").heartbeat, 5.0)
-check("preset storing can be enabled by the environment",
-      parse([], KRAMER_ALLOW_PRESET_STORE="1").allow_preset_store, True)
+check("preset changes can be enabled by the environment",
+      parse([], KRAMER_ALLOW_PRESET_CHANGES="1").allow_preset_changes, True)
 check("but not enabled by a blank one",
-      parse([], KRAMER_ALLOW_PRESET_STORE="").allow_preset_store, False)
+      parse([], KRAMER_ALLOW_PRESET_CHANGES="").allow_preset_changes, False)
+check("and the flag turns them on",
+      parse(["--allow-preset-changes"]).allow_preset_changes, True)
+# The deprecated spelling is what is written in compose files already deployed,
+# so it has to keep working - and it has to keep meaning the same thing, which
+# now includes emptying a slot. Both are store_true, so neither can withdraw the
+# permission: main() ors them rather than picking a winner.
+check("the deprecated flag still parses",
+      parse(["--allow-preset-store"]).allow_preset_store, True)
+check("as does the deprecated variable",
+      parse([], KRAMER_ALLOW_PRESET_STORE="1").allow_preset_store, True)
+check("and it does not set the current one behind its back",
+      parse(["--allow-preset-store"]).allow_preset_changes, False)
+check("neither name is on when nothing asks for it",
+      (parse([]).allow_preset_changes, parse([]).allow_preset_store),
+      (False, False))
+for argv, env, want in ((["--allow-preset-changes"], {}, True),
+                        (["--allow-preset-store"], {}, True),
+                        ([], {"KRAMER_ALLOW_PRESET_CHANGES": "1"}, True),
+                        ([], {"KRAMER_ALLOW_PRESET_STORE": "1"}, True),
+                        (["--allow-preset-changes", "--allow-preset-store"],
+                         {}, True),
+                        ([], {}, False)):
+    shown = " ".join(argv) or ", ".join(env) or "nothing"
+    check(f"permission from {shown}",
+          ks.preset_changes_allowed(parse(argv, **env)), want)
 check("panel locking can be enabled by the environment",
       parse([], KRAMER_ALLOW_PANEL_LOCK="1").allow_panel_lock, True)
 check("a blank variable does not enable it",
@@ -634,6 +735,86 @@ check("and the probe drops it", dl.connected, False)
 dl = beat_link(alive)
 dl._listen()
 check("listening leaves the link alone", dl.connected, True)
+
+
+# --- what the matrix announces on its own ---------------------------------- #
+# Measured on a VS-44HN, firmware 3.3: a front-panel switch, store and recall
+# are each announced, and a recall announces the slot and nothing else - the
+# switches it performs never arrive. Following the announcements alone would
+# therefore leave the routing showing what it was before the recall, which is
+# why instruction 4 schedules a read instead of being ignored.
+
+def frame(instr, inp, out, from_device=True):
+    return {"raw": f"{instr:02x} {inp:02x} {out:02x} 81",
+            "from_device": from_device, "instr": instr,
+            "input": inp, "output": out, "machine": 1}
+
+
+nl = ks.DeviceLink("203.0.113.1", 5000)         # reserved, never routed
+nl.routing = {1: 1, 2: 2, 3: 3, 4: 4}
+nl.presets = {n: False for n in range(1, 9)}
+quiet_log = ks.log
+ks.log = lambda *a, **k: None
+try:
+    nl._notified([frame(1, 4, 3)])
+    check("a front-panel switch moves the routing", nl.routing[3], 4)
+
+    nl.active_preset = 2
+    nl._notified([frame(1, 1, 3)])
+    check("and stops claiming a preset is in effect", nl.active_preset, None)
+
+    nl._notified([frame(3, 7, 0)])
+    check("a front-panel store fills the slot", nl.presets[7], True)
+    check("and that slot becomes the one in effect", nl.active_preset, 7)
+
+    nl._notified([frame(3, 7, 1)])
+    check("a front-panel delete empties it", nl.presets[7], False)
+    check("and it stops being in effect", nl.active_preset, None)
+
+    nl._notified([frame(4, 5, 0)])
+    check("a front-panel recall schedules a re-read", nl._resync, 5)
+    check("and claims nothing until that read has happened",
+          nl.active_preset, None)
+
+    before = dict(nl.routing)
+    nl._notified([frame(16, 0, 0)])
+    check("an error frame changes nothing", nl.routing, before)
+
+    nl.presets[2] = True
+    nl._notified([frame(3, 2, 1, from_device=False)])
+    check("a frame that is not from the device is ignored", nl.presets[2], True)
+
+    for slot in (0, 9):
+        nl._notified([frame(3, slot, 0)])
+        check(f"a store naming slot {slot} is ignored",
+              nl.presets.get(slot), None)
+
+    # The ordering is the point: a read that fails must not leave the UI saying
+    # a preset is in effect when the routing behind that claim was never read.
+    class ReadsBack:
+        def status(self):
+            return {1: 9, 2: 9, 3: 9, 4: 9}
+
+    nl._proto = ReadsBack()
+    nl._resync = 6
+    nl._maybe_resync()
+    check("the deferred read replaces the routing",
+          nl.routing, {1: 9, 2: 9, 3: 9, 4: 9})
+    check("and only then names the slot in effect", nl.active_preset, 6)
+    check("with nothing left pending", nl._resync, None)
+
+    class Broken:
+        def status(self):
+            raise OSError("link gone")
+
+    nl._proto = Broken()
+    nl.active_preset = None
+    nl._resync = 7
+    nl._maybe_resync()
+    check("a read that fails claims no preset", nl.active_preset, None)
+    check("and reports the link as down", nl.connected, False)
+finally:
+    ks.log = quiet_log
 
 
 # --- a retry loop must not repeat itself in the log ------------------------ #

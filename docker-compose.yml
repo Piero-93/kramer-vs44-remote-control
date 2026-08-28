@@ -46,9 +46,16 @@ services:
       # variable, so do not reuse a password you care about.
       # KRAMER_TOKEN: "something-long-and-uninteresting"
 
-      # Only on the day you set your presets up. It is the single destructive
-      # operation this service exposes, which is why it is off by default.
-      # KRAMER_ALLOW_PRESET_STORE: "1"
+      # Only on the day you set your presets up. Overwriting a preset and
+      # emptying one are the only destructive operations this service exposes,
+      # which is why they are off by default. Both are behind this one variable:
+      # it answers "may this service change what the hardware holds", and a wipe
+      # is that same change, not a milder one.
+      # KRAMER_ALLOW_PRESET_CHANGES: "1"
+      #
+      # KRAMER_ALLOW_PRESET_STORE is the old name for the same thing. It still
+      # works and still means both operations, but it logs a deprecation line at
+      # startup - if you have it set, rename it and nothing else changes.
 
       # Lets the page lock the front panel, which stops the buttons on the
       # machine itself from working. Off by default for a reason worth reading:

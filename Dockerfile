@@ -64,8 +64,14 @@ EXPOSE 8000
 # can honestly assert here: a switched-off matrix must not paint the app red.
 # http.client rather than urllib because it returns 401 as a response instead of
 # raising, and there is no curl in this image.
+# The body is read and the connection closed before exiting, rather than left
+# for process teardown. The service speaks HTTP/1.1 and keeps the connection
+# open for a next request, so an abrupt exit resets the socket instead of
+# closing it and the server sees a reset peer every thirty seconds. It no longer
+# prints a traceback for that either - see Server.handle_error - but a probe
+# that hangs up cleanly is the half of the fix that belongs here.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD python -c "import http.client,os,sys; c=http.client.HTTPConnection('127.0.0.1', int(os.environ.get('KRAMER_PORT','8000')), timeout=4); c.request('GET','/api/state'); sys.exit(0 if c.getresponse().status < 500 else 1)"
+  CMD python -c "import http.client,os,sys; c=http.client.HTTPConnection('127.0.0.1', int(os.environ.get('KRAMER_PORT','8000')), timeout=4); c.request('GET','/api/state'); r=c.getresponse(); s=r.status; r.read(); c.close(); sys.exit(0 if s < 500 else 1)"
 
 # Exec form, so this process is PID 1 and receives SIGTERM directly - which the
 # service installs a handler for. Without that handler a stop would skip the

@@ -316,6 +316,18 @@ class Protocol2000:
     def preset_store(self, n):
         return self._cmd(3, inp=n, out=0)       # output 0 = store, 1 = delete
 
+    def preset_delete(self, n):
+        """Empty slot n. Measured on a VS-44HN, firmware 3.3: instruction 3 with
+        OUTPUT 1 clears that one slot and leaves the others alone, and asking it
+        of a slot that is already empty is accepted and changes nothing.
+
+        Deliberately absent from Protocol 3000: no delete has been seen in the
+        device's own HELP and none has been tried, and guessing at a command
+        that empties a slot is not the place to guess. Callers therefore test
+        for this method rather than assume it, the way preset_defined already
+        is."""
+        return self._cmd(3, inp=n, out=1)
+
     def preset_recall(self, n):
         return self._cmd(4, inp=n, out=0)
 
@@ -733,7 +745,8 @@ def build_parser():
     sw.add_argument("output", type=int, help="1-4 (0 = all outputs)")
 
     for name, helptext in (("preset-recall", "recall a preset"),
-                           ("preset-store", "store the current layout into a preset")):
+                           ("preset-store", "store the current layout into a preset"),
+                           ("preset-delete", "empty a preset slot")):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("n", type=int, help="preset number (1-8)")
 
@@ -816,6 +829,12 @@ def run(args):
             print(proto.preset_recall(args.n))
         elif args.cmd == "preset-store":
             print(proto.preset_store(args.n))
+        elif args.cmd == "preset-delete":
+            delete = getattr(proto, "preset_delete", None)
+            if delete is None:
+                print(f"{proto.name} has no delete command for a single preset.")
+                return 1
+            print(delete(args.n))
         elif args.cmd == "presets":
             if is_p3:
                 print(proto.presets())

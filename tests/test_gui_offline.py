@@ -83,6 +83,145 @@ app._apply_notifications([])
 check("an empty batch does nothing", app.log.get("1.0", "end").strip(), "")
 
 
+# --- what the front panel says about the presets --------------------------- #
+# Measured on a VS-44HN: a store and a recall are each announced, and a recall
+# announces the slot and nothing else. Following the switches alone would leave
+# the grid showing what it was before it, so instruction 4 asks for a re-read.
+def notify(instr, inp, out, from_device=True):
+    app._apply_notifications([{"raw": f"{instr:02x} {inp:02x} {out:02x} 81",
+                               "from_device": from_device, "instr": instr,
+                               "input": inp, "output": out, "machine": 1}])
+
+
+app.log.delete("1.0", "end")
+for m in app.preset_marks:
+    m.set("")
+app._apply_active_preset(None)
+
+notify(3, 6, 0)
+check("a front-panel store lights the mark", app.preset_marks[5].get(), "●")
+check("and that slot becomes the one in effect", app.active_preset, 6)
+check("and it is spelled out, not only coloured",
+      "is what is routed now" in app.active_note.get(), True)
+check("the dot for that slot is coloured",
+      str(app.preset_dots[5].cget("foreground")), "#2e7d32")
+check("while another slot's is not",
+      str(app.preset_dots[0].cget("foreground")), "")
+
+notify(3, 6, 1)
+check("a front-panel delete clears the mark", app.preset_marks[5].get(), "")
+check("and it stops being in effect", app.active_preset, None)
+check("and the line goes quiet", app.active_note.get(), "")
+
+notify(3, 4, 0)
+notify(1, 2, 3)
+check("a front-panel switch drops the preset in effect", app.active_preset, None)
+check("but leaves the occupancy mark alone", app.preset_marks[3].get(), "●")
+
+submitted.clear()
+notify(4, 2, 0)
+check("a front-panel recall names the slot in effect", app.active_preset, 2)
+check("and is logged", "preset 2 recalled on the device"
+      in app.log.get("1.0", "end"), True)
+
+for slot in (0, 9):
+    before = [m.get() for m in app.preset_marks]
+    notify(3, slot, 0)
+    check(f"a store naming slot {slot} is ignored",
+          [m.get() for m in app.preset_marks], before)
+
+before = [m.get() for m in app.preset_marks]
+notify(3, 1, 0, from_device=False)
+check("a frame that is not from the device is ignored",
+      [m.get() for m in app.preset_marks], before)
+
+
+app._blank_grid()
+check("a lost link stops claiming a preset is in effect",
+      app.active_preset, None)
+check("and clears the line with it", app.active_note.get(), "")
+check("and forgets which slots were occupied", app.preset_known, {})
+app._apply_active_preset(None)
+
+
+# --- emptying a slot, and who is allowed to try ---------------------------- #
+# The rule being pinned is that only a slot KNOWN to be empty loses its buttons.
+# Not knowing is a third state: the occupancy probes land about a second after
+# the link comes up, and grey buttons in the meantime would be a claim the
+# program cannot make yet.
+check("there is an empty button per slot", len(app.preset_delete_btns), 8)
+
+app.connected = True
+app.preset_known.clear()
+app._sync_preset_buttons()
+check("an unread slot keeps its buttons",
+      str(app.preset_delete_btns[0].cget("state")), "normal")
+
+app._apply_preset_flags({1: False, 2: True})
+check("a slot read as empty loses the empty button",
+      str(app.preset_delete_btns[0].cget("state")), "disabled")
+check("and the recall button with it",
+      str(app.preset_recall_btns[0].cget("state")), "disabled")
+check("an occupied one keeps both",
+      (str(app.preset_delete_btns[1].cget("state")),
+       str(app.preset_recall_btns[1].cget("state"))), ("normal", "normal"))
+
+# _set_enabled walks the tree and switches every button on, so the per-slot
+# state has to survive it. This is the check that goes red if it stops doing so.
+app._set_enabled(True)
+check("a link coming up does not revive them",
+      str(app.preset_delete_btns[0].cget("state")), "disabled")
+
+app.log.delete("1.0", "end")
+submitted.clear()
+app._confirm_delete(1, False, True)
+check("emptying a slot already empty asks nothing", submitted, [])
+check("and says why", "already empty" in app.log.get("1.0", "end"), True)
+
+app.log.delete("1.0", "end")
+app._confirm_delete(2, True, False)
+check("a protocol without the command asks nothing", submitted, [])
+check("and says that, rather than offering a dialog",
+      "cannot empty a single preset" in app.log.get("1.0", "end"), True)
+
+asked = []
+real_askyesno = g.messagebox.askyesno
+g.messagebox.askyesno = lambda title, message: (asked.append(message), False)[1]
+try:
+    app._confirm_delete(2, True, True)
+    check("an occupied slot is confirmed first", len(asked), 1)
+    check("and the dialog says the layout is lost",
+          "will be lost" in asked[0], True)
+    check("and that the outputs are left alone",
+          "routing on the outputs is not changed" in asked[0], True)
+    check("saying no sends nothing", submitted, [])
+
+    g.messagebox.askyesno = lambda title, message: True
+    app._confirm_delete(2, True, True)
+    check("saying yes queues the delete", submitted, ["preset_deleted"])
+
+    asked.clear()
+    submitted.clear()
+    g.messagebox.askyesno = lambda title, message: (asked.append(message), True)[1]
+    app._confirm_delete(3, None, True)
+    check("a slot whose state could not be read still asks",
+          "Could not tell" in asked[0], True)
+finally:
+    g.messagebox.askyesno = real_askyesno
+
+app._apply_active_preset(2)
+app._handle("preset_deleted", (2, {2: False}), None)
+check("emptying the slot in effect clears it", app.active_preset, None)
+app._apply_active_preset(4)
+app._handle("preset_deleted", (1, {1: False}), None)
+check("emptying a different slot leaves it alone", app.active_preset, 4)
+
+app.connected = False
+app.preset_known.clear()
+app._apply_active_preset(None)
+app._sync_preset_buttons()
+
+
 # --- the worker owns the link ---------------------------------------------- #
 class _FakeTransport:
     def __init__(self, heard_ago=0.0):

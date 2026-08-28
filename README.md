@@ -333,8 +333,13 @@ python kramer_vs44.py --tcp 192.168.1.39 status       # read the current routing
 ```bash
 python kramer_vs44.py --tcp 192.168.1.39 preset-store 1    # save the current layout
 python kramer_vs44.py --tcp 192.168.1.39 preset-recall 1   # recall it
+python kramer_vs44.py --tcp 192.168.1.39 preset-delete 1   # empty the slot
 python kramer_vs44.py --tcp 192.168.1.39 presets           # list defined presets
 ```
+
+`preset-delete` is Protocol 2000 only. The device lists no per-slot delete in its own `#HELP` and
+none has been tried, so on Protocol 3000 the command says it is unavailable rather than guessing at
+a sequence that empties a slot. Emptying one that is already empty is accepted and changes nothing.
 
 ### Switching the device protocol
 
@@ -379,15 +384,28 @@ Note that here `--host` is the **matrix** address, while `kramer_server.py --hos
 that service listens on. Same word, different thing.
 
 The window offers a connection bar (network or serial, with protocol selection), a routing grid
-with one radio-button row per output, the 8 presets with recall/store buttons, a few utility
+with one radio-button row per output, the 8 presets with recall/store/empty buttons, a few utility
 actions, and a log panel showing every byte sent and received.
 
 Every preset that already holds a layout is marked with a dot (**●**), read from the device after
-connecting and refreshed after each store. **Store** asks first, and the question is answered
-against the slot as it is at that moment — not against the marks, which the front panel can have
-made stale — so it says whether the slot is empty or about to lose what it holds. On Protocol 3000
-there is no per-slot query, so the marks stay blank and the confirmation says the state could not
-be read. Recalling is never guarded: it is not destructive.
+connecting and refreshed after each change. **Store** and **✕ empty** both ask first, and the
+question is answered against the slot as it is at that moment — not against the marks, which the
+front panel can have made stale — so it says whether the slot is empty or about to lose what it
+holds. On Protocol 3000 there is no per-slot query, so the marks stay blank, the confirmation says
+the state could not be read, and emptying reports that the protocol has no such command.
+
+**Only a slot known to be empty loses its recall and empty buttons.** Not knowing is a third state
+and is treated as one: the occupancy probes land about a second after the link comes up, and
+greying a button out before they answer would be a claim the program cannot make yet. A slot that
+has not been read keeps its buttons — recalling an empty one is harmless anyway, since the device
+answers with an error frame and changes nothing.
+
+**The preset the routing came from is highlighted**, with the dot coloured and a line naming it in
+words. It is only ever set from something observed — a recall or a store, whether it came from this
+window, the web page or the front panel — and it drops back to nothing on any switch, on emptying
+that slot, and whenever the link goes down. Nothing highlighted therefore means **not known**,
+which is a different claim from "none of them": this device cannot be asked what a preset holds, so
+a routing that happens to match one is not something the program can detect.
 
 The **front-panel lock** is shown next to the utility buttons — *panel: LOCKED*, *panel: unlocked*,
 or *panel: unknown* when the device has not answered, which is what Protocol 3000 reports because
@@ -551,7 +569,8 @@ minute or two.
 | `--host ADDR` | `KRAMER_HOST` | `0.0.0.0` | address **this service** listens on, not the matrix; `127.0.0.1` keeps it on this machine only |
 | `--port N` | `KRAMER_PORT` | `8000` | HTTP port for this service |
 | `--token STRING` | `KRAMER_TOKEN` | none | require this token on every request |
-| `--allow-preset-store` | `KRAMER_ALLOW_PRESET_STORE` | off | permit overwriting the hardware presets |
+| `--allow-preset-changes` | `KRAMER_ALLOW_PRESET_CHANGES` | off | permit changing the hardware presets: overwriting one and emptying one |
+| `--allow-preset-store` | `KRAMER_ALLOW_PRESET_STORE` | off | **deprecated** alias for the row above; still honoured, logs a warning at startup |
 | `--allow-panel-lock` | `KRAMER_ALLOW_PANEL_LOCK` | off | permit **locking** the front panel; unlocking never needs it |
 | `--heartbeat SECONDS` | `KRAMER_HEARTBEAT` | `30` | probe the matrix after this much silence; `0` disables the check |
 | `--config PATH` | `KRAMER_CONFIG` | see below | settings file to use |
@@ -564,8 +583,14 @@ blank counts as unset, because that is what an empty form field sends.
 
 Two traps in that table worth naming. `--host` is *this service's* listen address, while
 `kramer_gui.py --host` is the *matrix* address — same word, different thing.
-`KRAMER_ALLOW_PRESET_STORE` can only switch preset storing **on**: an absent flag is not a flag that
-says "off", so to disable it again you clear the variable.
+`KRAMER_ALLOW_PRESET_CHANGES` can only switch preset changes **on**: an absent flag is not a flag
+that says "off", so to disable it again you clear the variable.
+
+The deprecated `--allow-preset-store` was named before emptying a slot existed, and it has gated
+that too since the day it did. The two spellings are **or**-ed rather than ranked: both are
+on-only, so a precedence rule with a winner would let the old name silently cancel the new one —
+and the deployments still using the old name are exactly the ones nobody is watching. Rename it
+when convenient; nothing else changes.
 
 ### Deliberate limits
 
@@ -651,34 +676,65 @@ Three notes worth having before you need them:
   fallback for when it is stopped — not a second window. See
   [Run one controller at a time](#️-run-one-controller-at-a-time).
 
-### Presets, and overwriting them
+### Presets: overwriting them, and emptying them
 
-Recalling a preset is a single tap and always available. **Storing** one is different: it replaces
-the slot's contents, and it is the only destructive operation the service exposes. It is therefore
-guarded three times over, from the outside in:
+Recalling a preset is a single tap and always available. **Storing** and **emptying** are
+different: one replaces the slot's contents and the other discards them, and they are the only
+destructive operations the service exposes. Both are guarded three times over, from the outside in:
 
-1. **The endpoint does not work unless the service was started with `--allow-preset-store`.**
-   Without it, `POST /api/preset/<n>/store` answers `403` and the page does not offer the function
-   at all. Presets get configured once in a while: start with the flag on that day, and the rest of
-   the time nothing reachable on the network can destroy them. This is the real gate — the two
-   below are in the page, and a page's protections are trivially bypassed by anyone able to send a
-   POST.
-2. **Storing lives in Settings, with its own buttons.** The Presets section recalls and nothing
-   else, so the part of the page used every day is incapable of destroying anything — no mode that
-   changes what a button does, and nothing to leave armed by mistake. Opening the panel sends no
-   command; it lists the routing that would be captured, with your own names, and eight slots
-   marked with a dot where they already hold a layout.
+1. **Neither endpoint works unless the service was started with `--allow-preset-changes`.**
+   Without it, `POST /api/preset/<n>/store` and `POST /api/preset/<n>/delete` answer `403` and the
+   page does not offer the functions at all. Presets get configured once in a while: start with the
+   flag on that day, and the rest of the time nothing reachable on the network can destroy them.
+   This is the real gate — the two below are in the page, and a page's protections are trivially
+   bypassed by anyone able to send a POST.
+
+   **One flag covers both on purpose.** It answers a single question — may this service change what
+   the hardware holds — and a wipe is that same change, not a milder one. A separate switch would
+   let a service be configured to refuse an overwrite while permitting a wipe, which is a
+   distinction nobody wants to have made by accident.
+2. **Each preset owns its own panel, and the everyday tap cannot reach it.** A preset tile recalls
+   and does nothing else; the `⋯` beside it opens that one slot's panel, and the overwrite and
+   empty buttons are not in the document at all until it is open. So there is no mode that changes
+   what a tap does and nothing to leave armed by mistake. Everything inside the panel is about
+   **one named slot** — which is the part worth keeping if this is ever rearranged. The layout it
+   replaced offered eight identical red squares labelled `1`–`8`, so the riskiest path was the one
+   carrying the least information about what you were about to hit.
 3. **The confirmation says what will happen**, listing the routing about to be captured with your
-   own names, and stating whether the slot is empty or about to lose what it holds.
+   own names, and stating whether the slot is empty or about to lose what it holds. The one in
+   front of emptying a slot says the other thing worth knowing: **the routing on the outputs does
+   not change.** A red button next to a routing grid looks like it might black out a monitor.
 
-The page also marks with a dot (**●**) every preset that already contains a layout. The service
-reads that at connect time with one query per slot, and refreshes it after a store.
+An empty slot is drawn as an empty bay — dashed outline, no recall — rather than carrying a mark
+saying it holds something. **The page has no occupancy dot, and the Tkinter window does**, which is
+not an oversight: the service reads the occupancy of all eight slots *before* it reports the link
+as up, so by the time the page renders, "empty" is known rather than merely unread. In the window
+the probes are queued after the link comes up, so "not read yet" is a state somebody can actually
+see there, and a dot is how it is told apart from "empty".
+
+Occupancy is read at connect time with one query per slot, refreshed after a store or a delete, and
+updated from what the matrix announces when the front panel is used.
+
+**Emptying a slot leaves the outputs alone.** It removes what the slot holds; nothing on screen
+changes. Asking to empty a slot that is already empty is accepted by the device and changes
+nothing, so it is not an error here either.
+
+**The preset the routing came from is highlighted**, the whole tile including its `⋯`, in the same
+accent the routing grid uses for a selected input — because it means the same thing: this is what
+the matrix is doing right now. It is set only from a recall or a store that this service watched
+happen — including one performed at
+the front panel — and cleared by any switch, by emptying that slot, and by a reconnection. Nothing
+highlighted means **not known**, never "none of them": `#PRST-VID?` is refused by this firmware, so
+a routing that happens to match a preset is not something the service can detect.
 
 ### Configuration, and where it lives
 
 Input, output and preset names are read from — and written to — **the same
 `kramer_gui_config.json` that the Tkinter GUI uses**, so both interfaces show the names you set
-once. "Edit names" in the browser writes them back.
+once. In the browser they are edited where they are read: the row and column headings of the
+routing grid are the fields, and a preset is renamed inside its own panel. **Each field saves
+itself when you leave it** — there is no button to forget to press, and nothing left unsaved when
+the tab is closed.
 
 Both programs resolve that one file the same way, highest precedence first:
 
@@ -707,17 +763,18 @@ memory and silently lost, because a rename that evaporates on restart is worse t
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "presets", "locked", "error", "allow_preset_store", "allow_panel_lock"}`; `routing` maps output to input with `0` meaning disconnected, `presets` maps slot to whether it holds a layout, `locked` is the front panel and is `null` when it has not been read |
+| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "presets", "active_preset", "locked", "error", "allow_preset_changes", "allow_panel_lock"}`; `routing` maps output to input with `0` meaning disconnected, `presets` maps slot to whether it holds a layout, `active_preset` is the slot the routing came from and is `null` when that is not known, `locked` is the front panel and is `null` when it has not been read. `allow_preset_store` is still sent as a deprecated alias of `allow_preset_changes`, so a page loaded before an upgrade keeps working |
 | `GET` | `/api/labels` | input, output and preset names |
 | `PUT` | `/api/labels` | any subset of `inputs`, `outputs`, `presets`; returns the complete set |
 | `POST` | `/api/route` | `{"input": 0-4, "output": 0-4}`; input `0` disconnects, output `0` means every output |
 | `POST` | `/api/preset/<n>/recall` | recalls preset 1-8, then re-reads the routing |
-| `POST` | `/api/preset/<n>/store` | overwrites preset 1-8 with the current routing; `403` unless `--allow-preset-store` |
+| `POST` | `/api/preset/<n>/store` | overwrites preset 1-8 with the current routing; `403` unless `--allow-preset-changes` |
+| `POST` | `/api/preset/<n>/delete` | empties preset 1-8, leaving the outputs untouched; `403` unless `--allow-preset-changes`. Emptying a slot that is already empty is accepted and changes nothing |
 | `POST` | `/api/lock` | `{"locked": true|false}` for the front panel; `403` on `true` unless `--allow-panel-lock`, never on `false`. Returns the state, having read the panel back from the device |
 | `GET` | `/api/events` | Server-Sent Events; `{"type": "state"|"labels", ...}` |
 
-Status codes worth knowing: `400` for a malformed or out-of-range request, `403` when preset storing
-or panel locking is disabled, `500` when the settings file cannot be written, `503` when the matrix is not currently
+Status codes worth knowing: `400` for a malformed or out-of-range request, `403` when preset changes
+or panel locking are disabled, `500` when the settings file cannot be written, `503` when the matrix is not currently
 connected, `504` when it did not answer in time. Note that `500` and `503` mean genuinely different
 things here — the first is a service installed wrong, the second is hardware that is not answering —
 so they are never used interchangeably.
@@ -728,7 +785,8 @@ client can show the truth rather than a stale grid.
 curl http://localhost:8000/api/state
 curl -X POST http://localhost:8000/api/route -H 'Content-Type: application/json' -d '{"input":2,"output":3}'
 curl -X POST http://localhost:8000/api/preset/1/recall
-curl -X POST http://localhost:8000/api/preset/1/store    # needs --allow-preset-store
+curl -X POST http://localhost:8000/api/preset/1/store    # needs --allow-preset-changes
+curl -X POST http://localhost:8000/api/preset/1/delete   # needs --allow-preset-changes
 curl -X POST http://localhost:8000/api/lock -H 'Content-Type: application/json' -d '{"locked":false}'
 curl -N http://localhost:8000/api/events
 ```
@@ -797,14 +855,15 @@ reach the unit temporarily, or move the matrix to an address on your own subnet 
 presets, EDID, panel lock, protocol switching. There is nothing you can do over LAN that you
 cannot do over RS-232 — Ethernet only saves you an adapter and a cable across the room.
 
-### 3. Verify routing and store your presets
+### 3. Verify routing, store your presets
 
 ```bash
 python kramer_vs44.py --tcp 192.168.1.39 shell
 ```
 
 Set up the layout you actually use, then store it. Eight slots are available. From then on a
-single command recreates the whole routing, and that is what you bind hotkeys to.
+single command recreates the whole routing, and that is what you bind hotkeys to. `preset-delete n`
+empties a slot again, leaving the outputs untouched.
 
 ## Protocol reference
 
@@ -820,7 +879,8 @@ byte4 = 1 OVR X M4..M0  machine number (1 -> 0x81)
 | Instruction | # | Example |
 |---|---|---|
 | SWITCH VIDEO | 1 | IN2→OUT3 = `01 82 83 81` |
-| STORE PRESET | 3 | preset 1 = `03 81 80 81` |
+| STORE PRESET | 3 | preset 1 = `03 81 80 81` (OUTPUT `0` = store) |
+| DELETE PRESET | 3 | preset 1 = `03 81 81 81` (OUTPUT `1` = delete) |
 | RECALL PRESET | 4 | preset 1 = `04 81 80 81` |
 | REQUEST STATUS OUTPUT | 5 | output 1 = `05 80 81 81` |
 | LOCK FRONT PANEL | 30 | lock = `1E 81 80 81` |
@@ -858,11 +918,25 @@ pressed. Measured on a VS-44HN over TCP, that is true — **but only for the fro
 
 | Event | Reported to a connected TCP client? |
 |---|---|
-| A front-panel button is pressed | **Yes, but to one client only.** An unprompted SWITCH VIDEO frame arrives, e.g. `41 84 83 81` = input 4 to output 3. With two clients connected, measured: exactly one of them receives it |
+| A front-panel **switch** | **Yes, but to one client only.** An unprompted SWITCH VIDEO frame arrives, e.g. `41 84 83 81` = input 4 to output 3. With two clients connected, measured: exactly one of them receives it |
+| A front-panel **store** into a preset | **Yes.** Instruction 3 with the slot in the INPUT field: `43 88 80 81` = preset 8 stored. Measured on both an empty slot and one already holding a layout, so a rewrite is announced too |
+| A front-panel **recall** of a preset | **Yes — but only the slot.** `44 84 80 81` = preset 4 recalled. **The switches the recall performs are never transmitted**, so a listener that follows announcements alone keeps showing the routing from before it |
 | Another TCP client issues `switch` | **No.** A listener on a second socket saw nothing while two switches were performed |
 
 So the state of the physical panel can be followed with no polling at all, which is what the GUI
 does. Changes made by other software on the network cannot, and need a periodic re-read.
+
+The recall row is the one that shapes the code. It was measured by switching output 3 away from
+what preset 4 holds, recalling preset 4 from the panel, and reading the routing back: the output
+had moved, and no SWITCH VIDEO frame had arrived to say so. **Instruction 4 therefore schedules a
+routing re-read** rather than being ignored — in the service between jobs, in the window as a
+deferred read — because the announcement says which slot, and reading the device is the only way to
+learn what it did. That read is also where a preset's contents become knowable at all, which is
+worth remembering: the device refuses `#PRST-VID?`, but a recall followed by a read tells you
+exactly what that slot holds.
+
+Instruction 3 is handled for a smaller reason and a real one: without it the occupancy dots go
+stale the moment somebody saves a preset at the machine, and stay stale until the next reconnect.
 
 The "one client only" part is the sharp edge, and it is why running two controllers is a technical
 constraint rather than a preference: the loser gets **no error and no indication** — it simply stops
@@ -1037,14 +1111,27 @@ These are deliberate choices, not accidents.
   retries a socket, because `SerialTransport` raises on open like anything else — but with no
   adapter here it has never actually been run.
 - **EDID commands are not implemented** (deliberately — see above).
+- **What a preset holds cannot be read from the device.** `#PRST-VID?` is listed by the unit's own
+  `#HELP` and refused in every form on firmware 3.3, and Protocol 2000 has no equivalent at all.
+  So the interfaces can say which slots hold *something* and which slot the routing came from, but
+  never what a slot would apply before you apply it. A recall followed by a read is the only way to
+  find out, and it is not a preview: it changes the outputs.
+- **A routing that happens to match a preset is not detected.** Following from the above, the
+  highlight means "this is the slot we watched being recalled or stored, and nothing has moved
+  since" — not "the current routing equals this slot's contents". Rebuild a preset's layout by hand
+  and nothing lights up.
+- **Deleting a preset is Protocol 2000 only.** The device lists no per-slot delete in its `#HELP`
+  and none has been tried, so Protocol 3000 reports the command as unavailable rather than guessing
+  at a sequence that empties a slot.
 
 ## Roadmap
 
 - **OS-level hotkeys** binding preset recall to a key combination — the original motivation for
   the project. A resident helper may be needed if Python's startup time is noticeable.
-- **Protocol unit tests**: `parse_raw`, `parse_vid_reply`, `hexdump`, and Protocol 2000 frame
-  generation compared against the verified byte sequences above. The GUI and the service already
-  have coverage in [`tests/`](tests/).
+- **Cover `parse_vid_reply`.** `parse_raw`, `hexdump` and Protocol 2000 frame generation are
+  checked against the verified byte sequences above in
+  [`tests/test_protocol_offline.py`](tests/test_protocol_offline.py); the Protocol 3000 reply
+  parser is the one piece of parsing with no test behind it.
 - **A login page for the web UI**, if it ever needs to leave a trusted network. The request gate is
   already one function; sessions and cookies are the work.
 - **Making the Tkinter GUI a client of the HTTP API** instead of opening a second direct
@@ -1065,10 +1152,11 @@ Issues and pull requests are welcome, especially:
 When reporting protocol behaviour, please include the output of the relevant command with `-v`
 so the raw bytes are visible.
 
-The three offline suites run in CI on every push and pull request, so a broken change shows up
+The four offline suites run in CI on every push and pull request, so a broken change shows up
 without anyone remembering to look. Running them locally first is still faster:
 
 ```bash
+python tests/test_paths_offline.py
 python tests/test_protocol_offline.py
 python tests/test_server_offline.py
 python tests/test_gui_offline.py

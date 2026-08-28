@@ -45,6 +45,7 @@ Endpoints
   POST /api/preset/<n>/recall recall preset n, then re-read the routing
   POST /api/preset/<n>/store  overwrite preset n with the current routing;
                               refused with 403 unless --allow-preset-store
+  POST /api/preset/<n>/delete empty preset n; behind the same flag as store
   POST /api/lock              {"locked": true|false} for the front panel;
                               locking is refused with 403 unless
                               --allow-panel-lock, unlocking never is
@@ -68,6 +69,14 @@ import kramer_vs44 as kv
 
 N_IO = 4
 N_PRESETS = 8
+
+# Protocol 2000 instructions that arrive unprompted from a VS-44HN when someone
+# uses the front panel. Measured, all three: a switch carries the routing, a
+# store carries the slot it filled (OUTPUT 0 = stored, 1 = deleted), and a
+# recall names the slot but says nothing about what it just changed.
+P2000_SWITCH_VIDEO = 1
+P2000_STORE_PRESET = 3
+P2000_RECALL_PRESET = 4
 
 # Shared with the Tkinter GUI on purpose, so both show the same names. Resolved
 # here so the module is usable without main(), and reassigned in main() once
@@ -155,12 +164,21 @@ class DeviceLink:
         # from a reply, so a page can show "unknown" instead of claiming the
         # buttons on the machine work when nobody has asked.
         self.locked = None
+        # The slot whose layout the routing currently is, or None for "not
+        # known". Only ever set from something observed - a recall, a store -
+        # and cleared by the first switch that moves away from it. It is never
+        # inferred by comparing the routing against remembered contents, because
+        # the device cannot be asked what a preset holds.
+        self.active_preset = None
         self.connected = False
         self.detail = f"TCP {host}:{port}"
         self.error = None
         self._transport = None
         self._proto = None
         self._jobs = queue.Queue()
+        # The slot the front panel recalled, cleared once the routing has been
+        # read again. See _maybe_resync.
+        self._resync = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="device-link")
@@ -201,6 +219,16 @@ class DeviceLink:
 
         self.presets = self.call(job, timeout=15.0)
 
+    def delete_preset(self, n):
+        """Empty slot n, then re-read the occupancy map for the same reason
+        store_preset does: the marks in the UI are the only warning before an
+        overwrite, so they have to follow the change that just happened."""
+        def job(proto):
+            proto.preset_delete(n)
+            return self._read_presets(proto)
+
+        self.presets = self.call(job, timeout=15.0)
+
     def set_lock(self, locked):
         """Lock or unlock the front panel and return what the device then says.
 
@@ -221,6 +249,7 @@ class DeviceLink:
             "protocol": self._proto.name if self._proto else None,
             "routing": {str(o): i for o, i in sorted(self.routing.items())},
             "presets": {str(n): v for n, v in sorted(self.presets.items())},
+            "active_preset": self.active_preset,
             "locked": self.locked,
             "error": self.error,
         }
@@ -236,6 +265,7 @@ class DeviceLink:
                 fn, box = self._jobs.get(timeout=self.IDLE_POLL)
             except queue.Empty:
                 self._listen()
+                self._maybe_resync()
                 self._maybe_beat()
                 continue
             try:
@@ -264,6 +294,10 @@ class DeviceLink:
                                       "Protocol 2000")
             self._transport, self._proto = transport, proto
             self.routing = proto.status()
+            # Whatever was active before this connection is not knowledge this
+            # one has: the routing may have been changed while nobody was
+            # listening, and no query returns the preset that produced it.
+            self.active_preset = None
             # Eight more commands, so it is read here and after a store, never
             # per request. Knowing which slots are occupied is what lets the UI
             # warn before overwriting one.
@@ -307,6 +341,32 @@ class DeviceLink:
             # socket, which is the only drop that can be noticed passively.
             self._drop(e)
 
+    def _maybe_resync(self):
+        """Re-read the routing after the front panel recalled a preset.
+
+        Measured on a VS-44HN: a recall is announced as its own frame, but the
+        switches it performs are not transmitted at all. Following the
+        announcements alone therefore leaves the routing showing whatever it was
+        before the recall, which is worse than showing nothing. Reading it back
+        is the only way to learn what changed.
+
+        It runs here, between jobs, because _notified is called from inside the
+        read loop of the command in flight and cannot issue one of its own."""
+        if not self._resync or not self._proto:
+            return
+        slot, self._resync = self._resync, None
+        try:
+            self.routing = self._proto.status()
+        except OSError as e:
+            self._drop(e)
+            return
+        # Set after the read, not before: what was just read is by definition
+        # what that slot holds, and a read that failed must not leave the UI
+        # claiming a preset is in effect.
+        self.active_preset = slot
+        log(f"routing re-read after the recall: {self.routing}")
+        self.on_change()
+
     def _maybe_beat(self):
         """Probe the link after a stretch of silence.
 
@@ -330,18 +390,51 @@ class DeviceLink:
 
     def _notified(self, frames):
         """Called on this thread by Protocol2000 for frames the matrix sent by
-        itself. Only SWITCH VIDEO carries routing; anything else is logged and
-        ignored rather than guessed at."""
-        changed = False
+        itself. SWITCH VIDEO carries routing, STORE PRESET carries occupancy,
+        and RECALL PRESET carries neither - only the slot - so it schedules a
+        re-read instead. Anything else is logged and ignored rather than guessed
+        at.
+
+        Nothing here reads from the device: this runs on the worker thread
+        inside the read loop of whatever command is in flight, so a command
+        issued here would interleave with that command's own reply."""
+        routed = presets = False
         for f in frames:
-            if f["instr"] == 1 and f["from_device"]:
+            if not f["from_device"]:
+                log(f"unsolicited frame ignored: {f['raw']}")
+                continue
+            if f["instr"] == P2000_SWITCH_VIDEO:
                 if self.routing.get(f["output"]) != f["input"]:
                     self.routing[f["output"]] = f["input"]
-                    changed = True
+                    routed = True
+                    # A recall never announces the switches it performs, so an
+                    # unprompted one is always somebody moving away from what
+                    # the preset laid out.
+                    self.active_preset = None
+            elif (f["instr"] == P2000_STORE_PRESET and f["output"] in (0, 1)
+                    and 1 <= f["input"] <= N_PRESETS):
+                defined = f["output"] == 0
+                log(f"preset {f['input']} "
+                    f"{'stored' if defined else 'deleted'} on the device")
+                if defined:
+                    # It now holds exactly what is routed, so it is active by
+                    # construction. A delete leaves the routing alone, but the
+                    # slot it came from no longer exists.
+                    self.active_preset = f["input"]
+                elif self.active_preset == f["input"]:
+                    self.active_preset = None
+                if self.presets.get(f["input"]) != defined:
+                    self.presets[f["input"]] = defined
+                    presets = True
+            elif (f["instr"] == P2000_RECALL_PRESET
+                    and 1 <= f["input"] <= N_PRESETS):
+                log(f"preset {f['input']} recalled on the device")
+                self._resync = f["input"]
             else:
                 log(f"unsolicited frame ignored: {f['raw']}")
-        if changed:
+        if routed:
             log(f"changed on the device: {self.routing}")
+        if routed or presets:
             self.on_change()
 
     def _drop(self, error):
@@ -405,6 +498,7 @@ class EventHub:
 
 PRESET_RECALL = re.compile(r"^/api/preset/(\d+)/recall$")
 PRESET_STORE = re.compile(r"^/api/preset/(\d+)/store$")
+PRESET_DELETE = re.compile(r"^/api/preset/(\d+)/delete$")
 TOKEN_IN_QUERY = re.compile(r"token=[^&\s]*")
 
 
@@ -529,6 +623,9 @@ class Handler(BaseHTTPRequestHandler):
         store = PRESET_STORE.match(path)
         if store:
             return self._do_preset_store(int(store.group(1)))
+        delete = PRESET_DELETE.match(path)
+        if delete:
+            return self._do_preset_delete(int(delete.group(1)))
         self._error(404, f"no such resource: {path}")
 
     # ----- handlers -------------------------------------------------------- #
@@ -601,6 +698,10 @@ class Handler(BaseHTTPRequestHandler):
             link.routing = {o: inp for o in range(1, N_IO + 1)}
         else:
             link.routing[out] = inp
+        # Whatever preset was in effect no longer is, even if this switch put
+        # back exactly what it had: the service cannot read a preset to find
+        # out, so the honest answer here is "not known" rather than a guess.
+        link.active_preset = None
         log(f"routed input {inp} to output {out} for {self.address_string()}")
         self.server.publish_state()
         self._json(200, self.server.state_payload())
@@ -622,6 +723,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(503, str(e))
         except (TimeoutError, OSError) as e:
             return self._error(504, str(e))
+        link.active_preset = n
         log(f"recalled preset {n} for {self.address_string()}, "
             f"routing {link.routing}")
         self.server.publish_state()
@@ -665,12 +767,12 @@ class Handler(BaseHTTPRequestHandler):
         """The only destructive operation exposed, so it is off unless the
         service was started with --allow-preset-store. The confirmation in the
         page is a courtesy; this is the actual gate."""
-        if not self.server.allow_preset_store:
+        if not self.server.allow_preset_changes:
             # Name the environment variable too: in a container there is no shell
             # to restart the service in, and the remedy is a redeploy.
-            return self._error(403, "storing presets is disabled: restart the "
-                                    "service with --allow-preset-store, or set "
-                                    "KRAMER_ALLOW_PRESET_STORE=1")
+            return self._error(403, "changing presets is disabled: restart the "
+                                    "service with --allow-preset-changes, or "
+                                    "set KRAMER_ALLOW_PRESET_CHANGES=1")
         if not 1 <= n <= N_PRESETS:
             return self._error(400, f"preset must be between 1 and {N_PRESETS}")
         link = self.server.link
@@ -681,9 +783,44 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(503, str(e))
         except (TimeoutError, OSError) as e:
             return self._error(504, str(e))
+        # The slot now holds exactly what is routed, so it is in effect.
+        link.active_preset = n
         log(f"stored preset {n} for {self.address_string()} "
             f"({'overwritten' if was_defined else 'was empty'}), "
             f"routing {link.routing}")
+        self.server.publish_state()
+        self._json(200, self.server.state_payload())
+
+    def _do_preset_delete(self, n):
+        """Behind the same flag as storing, and deliberately not its own.
+
+        The flag answers one question - may this service change what the
+        hardware holds in its presets - and emptying a slot is that same change,
+        not a milder one. A separate switch would let a service be configured to
+        refuse an overwrite while permitting a wipe, which is a distinction
+        nobody wants to have made by accident."""
+        if not self.server.allow_preset_changes:
+            # Name the environment variable too: in a container there is no shell
+            # to restart the service in, and the remedy is a redeploy.
+            return self._error(403, "changing presets is disabled: restart the "
+                                    "service with --allow-preset-changes, or "
+                                    "set KRAMER_ALLOW_PRESET_CHANGES=1")
+        if not 1 <= n <= N_PRESETS:
+            return self._error(400, f"preset must be between 1 and {N_PRESETS}")
+        link = self.server.link
+        was_defined = link.presets.get(n)
+        try:
+            link.delete_preset(n)
+        except ConnectionError as e:
+            return self._error(503, str(e))
+        except (TimeoutError, OSError) as e:
+            return self._error(504, str(e))
+        # The routing is untouched by a delete, but the slot that explains it
+        # is gone, so there is nothing left to point at.
+        if link.active_preset == n:
+            link.active_preset = None
+        log(f"deleted preset {n} for {self.address_string()} "
+            f"({'held a layout' if was_defined else 'was already empty'})")
         self.server.publish_state()
         self._json(200, self.server.state_payload())
 
@@ -727,20 +864,24 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, link, token=None, allow_preset_store=False,
+    def __init__(self, address, link, token=None, allow_preset_changes=False,
                  allow_panel_lock=False):
         super().__init__(address, Handler)
         self.link = link
         self.hub = EventHub()
         self.token = token
-        self.allow_preset_store = allow_preset_store
+        self.allow_preset_changes = allow_preset_changes
         self.allow_panel_lock = allow_panel_lock
 
     def state_payload(self):
         """Device state plus what this service permits, so the page can hide a
         function it is not allowed to use instead of offering a dead button."""
         return {**self.link.snapshot(),
-                "allow_preset_store": self.allow_preset_store,
+                "allow_preset_changes": self.allow_preset_changes,
+                # Deprecated alias, kept so a page loaded before an upgrade goes
+                # on working until it is reloaded. Remove it once nothing reads
+                # it - the page prefers the name above.
+                "allow_preset_store": self.allow_preset_changes,
                 "allow_panel_lock": self.allow_panel_lock}
 
     def publish_state(self):
@@ -779,12 +920,22 @@ def build_parser():
     ap.add_argument("--token", default=kp.env_default("KRAMER_TOKEN"),
                     help="require this token on every request (env KRAMER_TOKEN; "
                          "Authorization: Bearer, or ?token=)")
+    ap.add_argument("--allow-preset-changes", action="store_true",
+                    default=kp.env_flag("KRAMER_ALLOW_PRESET_CHANGES"),
+                    help="allow changing the hardware presets - overwriting one "
+                         "and emptying one - off by default because they are the "
+                         "only destructive operations here (env "
+                         "KRAMER_ALLOW_PRESET_CHANGES=1). Note the flag can only "
+                         "turn this on: clear the variable to turn it off")
+    # Deprecated spelling, kept working because it is what is written in the
+    # compose files and TrueNAS app definitions already deployed. It only ever
+    # covered storing by name; it has gated emptying a slot since that existed,
+    # which is exactly why the honest name was added next to it.
     ap.add_argument("--allow-preset-store", action="store_true",
                     default=kp.env_flag("KRAMER_ALLOW_PRESET_STORE"),
-                    help="allow overwriting the hardware presets; off by default "
-                         "because it is the only destructive operation here (env "
-                         "KRAMER_ALLOW_PRESET_STORE=1). Note the flag can only "
-                         "turn this on: clear the variable to turn it off")
+                    help="deprecated alias for --allow-preset-changes (env "
+                         "KRAMER_ALLOW_PRESET_STORE=1); still honoured, and it "
+                         "permits emptying a preset as well as overwriting one")
     ap.add_argument("--allow-panel-lock", action="store_true",
                     default=kp.env_flag("KRAMER_ALLOW_PANEL_LOCK"),
                     help="allow locking the front panel; off by default because "
@@ -803,17 +954,30 @@ def build_parser():
     return ap
 
 
+def preset_changes_allowed(args):
+    """Either spelling turns it on, and neither can turn it off.
+
+    Both are store_true, so the only way to withdraw the permission is to stop
+    passing them - which is why this is an or rather than a precedence rule with
+    a winner. A rule with a winner would let the deprecated name silently cancel
+    the current one, and the deployments that still use it are exactly the ones
+    nobody is watching."""
+    return bool(args.allow_preset_changes or args.allow_preset_store)
+
+
 def main():
     global CONFIG_PATH
     args = build_parser().parse_args()
     CONFIG_PATH = kp.config_path(args.config)
+
+    allow_preset_changes = preset_changes_allowed(args)
 
     host, _, port = args.matrix.partition(":")
     link = DeviceLink(host, int(port) if port else kv.DEFAULT_TCP_PORT,
                       args.machine, heartbeat=args.heartbeat)
     try:
         server = Server((args.host, args.port), link, args.token,
-                        args.allow_preset_store, args.allow_panel_lock)
+                        allow_preset_changes, args.allow_panel_lock)
     except OSError as e:
         # Almost always the port being taken. A traceback here tells the reader
         # nothing they can act on, and this is the first thing that goes wrong.
@@ -846,7 +1010,12 @@ def main():
     if not args.token:
         log("no token set: anyone on this network can switch the matrix")
     if args.allow_preset_store:
-        log("preset storing is ENABLED: the hardware presets can be overwritten")
+        log("--allow-preset-store / KRAMER_ALLOW_PRESET_STORE is deprecated: "
+            "use --allow-preset-changes / KRAMER_ALLOW_PRESET_CHANGES. The old "
+            "name still works and means the same thing")
+    if allow_preset_changes:
+        log("preset changes are ENABLED: the hardware presets can be "
+            "overwritten and emptied")
     if args.allow_panel_lock:
         log("front-panel locking is ENABLED: the buttons on the machine can be "
             "disabled from the browser")

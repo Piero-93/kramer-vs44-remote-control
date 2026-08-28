@@ -78,9 +78,14 @@ AUTOREFRESH_INTERVALS = (5, 10, 30, 60)
 # one, and alt-tabbing back and forth would otherwise keep the bus busy.
 FOCUS_REFRESH_MIN_GAP = 1.5
 
-# Protocol 2000 instruction 1, SWITCH VIDEO. The only unsolicited frame observed
-# from a VS-44HN, sent when a front-panel button is pressed.
+# Protocol 2000 instructions a VS-44HN sends unprompted when someone uses the
+# front panel. All three are measured: a switch carries the routing, a store
+# carries the slot it filled (OUTPUT 0 = stored, 1 = deleted), and a recall
+# names the slot without saying what it changed - so the switches a recall
+# performs are never announced.
 P2000_SWITCH_VIDEO = 1
+P2000_STORE_PRESET = 3
+P2000_RECALL_PRESET = 4
 
 
 # Set by load_config() when the settings file was there but unusable, and shown
@@ -435,6 +440,15 @@ class App:
         # Widgets that must stay disabled even when the link comes up, because
         # _set_enabled() otherwise walks the tree and switches every button on.
         self._never_enable = set()
+        # The slot whose layout is currently routed, or None for "not known".
+        # Only ever set from something observed - a recall, a store - never by
+        # comparing the routing against remembered contents, because a preset
+        # cannot be read back from this device.
+        self.active_preset = None
+        self.active_note = tk.StringVar(value="")
+        # {slot: bool} for what has actually been read. A slot missing from here
+        # is unknown, which is not the same as empty - see _sync_preset_buttons.
+        self.preset_known = {}
 
         root.title("Kramer VS-44HN — matrix control")
         root.minsize(720, 640)
@@ -584,20 +598,41 @@ class App:
         f.pack(fill="x", padx=10, pady=4)
         self.preset_labels = []
         self.preset_marks = []
+        self.preset_dots = []
+        self.preset_recall_btns = []
+        self.preset_delete_btns = []
         for n in range(1, self.N_PRESETS + 1):
             r, c = divmod(n - 1, 4)
             box = ttk.Frame(f)
             box.grid(row=r, column=c, padx=4, pady=3, sticky="w")
             mark = tk.StringVar(value="")
-            ttk.Label(box, textvariable=mark, width=2).pack(side="left")
+            dot = ttk.Label(box, textvariable=mark, width=2)
+            dot.pack(side="left")
             self.preset_marks.append(mark)
+            self.preset_dots.append(dot)
             v = tk.StringVar(value=self.cfg["presets"][n - 1])
             ttk.Entry(box, textvariable=v, width=14).pack(side="left")
             self.preset_labels.append(v)
-            ttk.Button(box, text="▶", width=3,
-                       command=lambda n=n: self._preset_recall(n)).pack(side="left", padx=2)
-            ttk.Button(box, text="store", width=6,
+            play = ttk.Button(box, text="▶", width=3,
+                              command=lambda n=n: self._preset_recall(n))
+            play.pack(side="left", padx=2)
+            self.preset_recall_btns.append(play)
+            ttk.Button(box, text="Store", width=6,
                        command=lambda n=n: self._preset_store(n)).pack(side="left")
+            wipe = ttk.Button(box, text="✕", width=3,
+                              command=lambda n=n: self._preset_delete(n))
+            wipe.pack(side="left", padx=(2, 0))
+            self.preset_delete_btns.append(wipe)
+        # Colour alone would be the only channel saying which slot is in effect,
+        # so it is spelled out here as well. It says nothing at all until
+        # something has been observed - see _apply_active_preset.
+        ttk.Label(f, textvariable=self.active_note, foreground="#2e7d32").grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Label(f, text="● holds a layout.  ▶ recalls,  Store overwrites,  "
+                          "✕ empties the slot. Both ask first, and what they "
+                          "ask is read from the matrix at that moment.",
+                  foreground="#666", wraplength=680, justify="left").grid(
+            row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
 
     def _build_utility(self):
         f = ttk.LabelFrame(self.root, text="Utility", padding=8)
@@ -667,6 +702,8 @@ class App:
         for w in (self.connect_btn,):
             w.configure(state="normal")
         self._sync_mode()
+        # After the walk, not before: it has just switched every button on.
+        self._sync_preset_buttons()
 
     def _walk_state(self, widget, state):
         cls = widget.winfo_class()
@@ -791,6 +828,20 @@ class App:
             n, flags = res
             self._write_log(f"   preset {n} stored")
             self._apply_preset_flags(flags)
+            # It now holds exactly what is routed, so it is in effect.
+            self._apply_active_preset(n)
+        elif tag == "preset_ask_delete":
+            n, flags, supported = res
+            self._apply_preset_flags(flags)
+            self._confirm_delete(n, (flags or {}).get(n), supported)
+        elif tag == "preset_deleted":
+            n, flags = res
+            self._write_log(f"   preset {n} emptied")
+            self._apply_preset_flags(flags)
+            # The routing is untouched by this, but the slot that explained it
+            # is gone, so there is nothing left to point at.
+            if self.active_preset == n:
+                self._apply_active_preset(None)
         elif tag == "lock":
             self._apply_lock(res)
         elif tag == "lock_read":
@@ -844,6 +895,11 @@ class App:
             v.set(-1)
         for m in self.preset_marks:
             m.set("")
+        # Emptied rather than set to False: the front panel can fill or empty a
+        # slot while the link is down, so what was read is no longer knowledge.
+        self.preset_known.clear()
+        self._sync_preset_buttons()
+        self._apply_active_preset(None)
         # The panel could be locked or unlocked from the front while the link is
         # down, and this indicator is the one thing here that describes hardware
         # somebody else can touch. Showing a remembered value would be worse than
@@ -889,16 +945,47 @@ class App:
 
     def _apply_notifications(self, frames):
         """Frames the device transmitted on its own, typically a front-panel
-        press. Only SWITCH VIDEO carries routing information; anything else is
-        logged and ignored rather than guessed at."""
-        routed = {}
+        press. SWITCH VIDEO carries routing, STORE PRESET carries occupancy,
+        and RECALL PRESET carries neither - only the slot - so it schedules a
+        re-read instead. Anything else is logged and ignored rather than guessed
+        at."""
+        routed, flags, recalled = {}, {}, None
         for f in frames or ():
-            if f["instr"] == P2000_SWITCH_VIDEO and f["from_device"]:
+            if not f["from_device"]:
+                self._write_log(f"   unsolicited frame ignored: {f['raw']}")
+            elif f["instr"] == P2000_SWITCH_VIDEO:
                 routed[f["output"]] = f["input"]
+                # A recall never announces the switches it performs, so an
+                # unprompted one is somebody moving away from the preset.
+                self._apply_active_preset(None)
+            elif (f["instr"] == P2000_STORE_PRESET and f["output"] in (0, 1)
+                    and 1 <= f["input"] <= self.N_PRESETS):
+                defined = f["output"] == 0
+                flags[f["input"]] = defined
+                self._write_log(f"   preset {f['input']} "
+                                f"{'stored' if defined else 'deleted'} "
+                                f"on the device")
+                if defined:
+                    self._apply_active_preset(f["input"])
+                elif self.active_preset == f["input"]:
+                    self._apply_active_preset(None)
+            elif (f["instr"] == P2000_RECALL_PRESET
+                    and 1 <= f["input"] <= self.N_PRESETS):
+                recalled = f["input"]
+                self._write_log(f"   preset {recalled} recalled on the device")
             else:
                 self._write_log(f"   unsolicited frame ignored: {f['raw']}")
         if routed:
             self._apply_status(routed, quiet=True)
+        if flags:
+            self._apply_preset_flags(flags)
+        if recalled:
+            # A recall announces the slot and nothing else: the switches it
+            # performs are never transmitted, so the grid would keep showing the
+            # routing from before it. Same delay as our own recall uses, for the
+            # same reason - the device needs a moment to finish applying it.
+            self.root.after(900, lambda: self._refresh(quiet=True))
+            self._apply_active_preset(recalled)
 
     # ----- automatic refresh ---------------------------------------------- #
 
@@ -1013,6 +1100,9 @@ class App:
         src = "disconnected" if inp == 0 else self.in_labels[inp - 1].get()
         self._write_log(f"-> {src} to {label}")
         self.worker.submit("switch", lambda w: w.proto.switch(inp, out))
+        # Even a switch that puts back exactly what the preset had leaves this
+        # unknown: the slot cannot be read, so there is nothing to compare with.
+        self._apply_active_preset(None)
         if out == 0:
             for v in self.route_vars.values():
                 v.set(inp)
@@ -1051,6 +1141,7 @@ class App:
         self._write_log(f"-> recalling preset {n} ({self.preset_labels[n-1].get()})")
         self.worker.submit("preset", lambda w: w.proto.preset_recall(n))
         self.root.after(900, self._refresh)
+        self._apply_active_preset(n)
 
     def _preset_store(self, n):
         """Read the slot before asking, rather than trusting the cached mark.
@@ -1083,6 +1174,58 @@ class App:
             return (n, preset_flags(w.proto, [n]))
         self.worker.submit("preset_stored", job)
 
+    def _sync_preset_buttons(self):
+        """Take the recall and empty buttons away from a slot known to be empty.
+
+        Known is the operative word. The occupancy probes land about a second
+        after the link comes up, and greying a button out before they answer
+        would be a claim this program cannot make yet - so a slot that has not
+        been read keeps its buttons. Recalling an empty slot is harmless anyway:
+        the device answers with an error frame and changes nothing."""
+        for n in range(1, self.N_PRESETS + 1):
+            empty = self.preset_known.get(n) is False
+            state = "normal" if self.connected and not empty else "disabled"
+            self.preset_recall_btns[n - 1].configure(state=state)
+            self.preset_delete_btns[n - 1].configure(state=state)
+
+    def _preset_delete(self, n):
+        """Ask the device before asking the user, exactly as storing does.
+
+        The dialog is the last thing between a mis-click and a lost layout, so
+        what it says has to be true at that moment: the front panel can have
+        filled or emptied the slot since the marks were read."""
+        if not self.connected:
+            return
+        self.worker.submit(
+            "preset_ask_delete",
+            lambda w: (n, preset_flags(w.proto, [n]),
+                       hasattr(w.proto, "preset_delete")))
+
+    def _confirm_delete(self, n, defined, supported):
+        if not supported:
+            # Protocol 3000 has no per-slot delete in this device's own HELP and
+            # none has been tried. Saying so beats offering a dialog that leads
+            # to a command nobody has verified.
+            self._write_log("   this protocol cannot empty a single preset")
+            return
+        if defined is False:
+            self._write_log(f"   preset {n} is already empty")
+            return
+        name = self.preset_labels[n - 1].get()
+        detail = ("It holds a layout, which will be lost."
+                  if defined else "Could not tell whether this slot is in use.")
+        if not messagebox.askyesno(
+                "Empty the preset?",
+                f"Empty preset {n} ({name})?\n{detail}\n\n"
+                "The routing on the outputs is not changed."):
+            return
+        self._write_log(f"-> emptying preset {n}")
+
+        def job(w):
+            w.proto.preset_delete(n)
+            return (n, preset_flags(w.proto, [n]))
+        self.worker.submit("preset_deleted", job)
+
     def _apply_preset_flags(self, flags):
         """A slot whose state could not be read keeps the mark it had: blanking
         it would claim the slot is empty, which is the one thing worth being
@@ -1091,6 +1234,25 @@ class App:
             if defined is None:
                 continue
             self.preset_marks[n - 1].set("●" if defined else "")
+            self.preset_known[n] = defined
+        self._sync_preset_buttons()
+
+    def _apply_active_preset(self, n):
+        """Show which slot the routing came from, or nothing when it is unknown.
+
+        Nothing is the honest state after a connect: the routing can have been
+        changed while this program was not listening, and no query on this
+        device returns the preset that produced it. The dot is also coloured,
+        but the line spells it out - colour on its own is not a channel every
+        reader has."""
+        self.active_preset = n
+        for i, dot in enumerate(self.preset_dots, start=1):
+            dot.configure(foreground="#2e7d32" if i == n else "")
+        if n is None:
+            self.active_note.set("")
+        else:
+            self.active_note.set(f"● {self.preset_labels[n - 1].get()} "
+                                 f"is what is routed now.")
 
     def _apply_lock(self, locked, quiet=False):
         """Show the panel state, and say nothing when it is not known.

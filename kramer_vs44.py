@@ -65,6 +65,13 @@ BAUD = 9600                      # identical for both protocols on the VS-44HN
 HEARTBEAT = 30.0                 # silence tolerated before probing a link
 RECONNECT_DELAY = 3.0            # pause before retrying a failed connection
 
+# Protocol 2000 instruction 16: the device's ERROR reply. It is what comes back
+# instead of an echo when a command is refused - recalling an empty preset, for
+# one - and it necessarily carries a different instruction number from the
+# command it answers, which is why _cmd has to name it rather than treat it as
+# something that arrived on its own.
+P2000_ERROR = 16
+
 # Protocol 2000: instruction 56 (0x38), output=3 -> switch to Protocol 3000
 P2000_TO_P3000 = bytes([0x38, 0x80, 0x83, 0x81])
 
@@ -259,10 +266,20 @@ class Protocol2000:
             other = [f for f in frames if f["instr"] != instr]
             if other and self.on_notify:
                 self.on_notify(other)
+            if reply:
+                return reply
+            # A refusal IS the answer, even though its instruction number says
+            # otherwise. Checked only once no real reply turned up in this read,
+            # so a refusal arriving alongside one does not discard it. Without
+            # this the loop waits out the whole deadline for an answer that has
+            # already come, and every rejected command costs a second of bus
+            # time and reports itself in the log as a front-panel press.
+            if any(f["instr"] == P2000_ERROR for f in other):
+                return []
             # Retry only when frames arrived and none of them was the answer.
             # Nothing at all means the read already spent its timeout - or that
             # this is a dry run - so looping again would just burn CPU.
-            if reply or not frames or time.monotonic() >= deadline:
+            if not frames or time.monotonic() >= deadline:
                 return reply
 
     def poll_notifications(self, timeout=0.2):

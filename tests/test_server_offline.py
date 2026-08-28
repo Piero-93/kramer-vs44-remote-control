@@ -779,6 +779,15 @@ try:
     before = dict(nl.routing)
     nl._notified([frame(16, 0, 0)])
     check("an error frame changes nothing", nl.routing, before)
+    # It is the refusal of the command that was in flight, not something the
+    # front panel did, and the log has to say which - somebody reading "ignored"
+    # goes looking for a button press that never happened.
+    said = []
+    ks.log = said.append
+    nl._notified([frame(16, 0, 0)])
+    ks.log = lambda *a, **k: None
+    check("and is reported as a refusal, not as unsolicited",
+          "refused" in said[0] and "unsolicited" not in said[0], True)
 
     nl.presets[2] = True
     nl._notified([frame(3, 2, 1, from_device=False)])

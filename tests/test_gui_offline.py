@@ -135,6 +135,12 @@ notify(3, 1, 0, from_device=False)
 check("a frame that is not from the device is ignored",
       [m.get() for m in app.preset_marks], before)
 
+app.log.delete("1.0", "end")
+notify(16, 0, 0)
+check("an error frame is reported as a refusal",
+      "the matrix refused a command" in app.log.get("1.0", "end"), True)
+check("and not as something the front panel did",
+      "unsolicited" in app.log.get("1.0", "end"), False)
 
 app._blank_grid()
 check("a lost link stops claiming a preset is in effect",

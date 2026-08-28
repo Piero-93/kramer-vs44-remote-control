@@ -185,6 +185,30 @@ t = transport_with([None])
 proto = kv.Protocol2000(t)
 check("no reply gives an empty list", proto._cmd(5, inp=0, out=1), [])
 
+# Instruction 16 is the device's refusal, and it necessarily carries a different
+# instruction number from the command it answers - so before it was named here,
+# it went to on_notify as if the front panel had done something and the loop
+# waited out its whole deadline for an answer that had already arrived.
+# Measured on a VS-44HN: recalling an empty preset replies 50 80 80 81.
+seen = []
+t = transport_with([bytes([0x50, 0x80, 0x80, 0x81]), None, None, None])
+proto = kv.Protocol2000(t)
+proto.on_notify = seen.append
+began = time.monotonic()
+reply = proto._cmd(4, inp=8, out=0)
+took = time.monotonic() - began
+check("a refused command gives an empty list", reply, [])
+check("and does not wait out the deadline for it", took < 0.5, True)
+check("the refusal is still handed to the caller's hook", len(seen), 1)
+check("as instruction 16", seen[0][0]["instr"], kv.P2000_ERROR)
+
+# A refusal arriving alongside the real answer must not throw the answer away.
+t = transport_with([bytes([0x50, 0x80, 0x80, 0x81]) +
+                    bytes([0x45, 0x80, 0x82, 0x81])])
+proto = kv.Protocol2000(t)
+check("an answer in the same read still wins",
+      proto._cmd(5, inp=0, out=2)[0]["output"], 2)
+
 # --- the transport records when the device last said something ------------- #
 t = transport_with([None])
 check("nothing heard yet", t.last_rx, 0.0)

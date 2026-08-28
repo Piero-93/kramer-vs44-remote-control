@@ -430,6 +430,11 @@ class DeviceLink:
                     and 1 <= f["input"] <= N_PRESETS):
                 log(f"preset {f['input']} recalled on the device")
                 self._resync = f["input"]
+            elif f["instr"] == kv.P2000_ERROR:
+                # Not unsolicited at all: the device refused the command that
+                # was in flight. Saying "ignored" here sent whoever read the log
+                # looking for a front-panel press that never happened.
+                log(f"the matrix refused a command: {f['raw']}")
             else:
                 log(f"unsolicited frame ignored: {f['raw']}")
         if routed:

@@ -883,6 +883,7 @@ byte4 = 1 OVR X M4..M0  machine number (1 -> 0x81)
 | DELETE PRESET | 3 | preset 1 = `03 81 81 81` (OUTPUT `1` = delete) |
 | RECALL PRESET | 4 | preset 1 = `04 81 80 81` |
 | REQUEST STATUS OUTPUT | 5 | output 1 = `05 80 81 81` |
+| ERROR (from the device) | 16 | refusal = `50 80 80 81` |
 | LOCK FRONT PANEL | 30 | lock = `1E 81 80 81` |
 | CHANGE TO ASCII (→P3000) | 56 | `38 80 83 81` |
 | IDENTIFY MACHINE | 61 | video name = `3D 81 80 81` |
@@ -937,6 +938,13 @@ exactly what that slot holds.
 
 Instruction 3 is handled for a smaller reason and a real one: without it the occupancy dots go
 stale the moment somebody saves a preset at the machine, and stay stale until the next reconnect.
+
+**Instruction 16 is the device refusing a command**, and it is not unsolicited at all — but it
+necessarily carries a different instruction number from the command it answers, which is exactly
+how a reply is told apart from a notification here. Until it was named, every refused command cost
+a full second while the read waited for an answer that had already arrived, the caller got an empty
+result indistinguishable from silence, and the log said a front-panel press had been ignored.
+Measured: recalling an empty preset replies `50 80 80 81` and changes nothing.
 
 The "one client only" part is the sharp edge, and it is why running two controllers is a technical
 constraint rather than a preference: the loser gets **no error and no indication** — it simply stops

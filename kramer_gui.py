@@ -973,6 +973,11 @@ class App:
                     and 1 <= f["input"] <= self.N_PRESETS):
                 recalled = f["input"]
                 self._write_log(f"   preset {recalled} recalled on the device")
+            elif f["instr"] == kv.P2000_ERROR:
+                # Not unsolicited at all: the device refused the command that
+                # was in flight. Calling that "ignored" sent whoever read the
+                # log looking for a front-panel press that never happened.
+                self._write_log(f"   the matrix refused a command: {f['raw']}")
             else:
                 self._write_log(f"   unsolicited frame ignored: {f['raw']}")
         if routed:

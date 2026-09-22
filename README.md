@@ -43,6 +43,7 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 - [GUI](#gui)
 - [Web service and browser UI](#web-service-and-browser-ui)
 - [Running it as a service with Docker](#running-it-as-a-service-with-docker)
+- [Behind a reverse proxy](#behind-a-reverse-proxy)
 - [First-time setup](#first-time-setup)
 - [Protocol reference](#protocol-reference)
 - [Troubleshooting](#troubleshooting)
@@ -568,10 +569,11 @@ minute or two.
 | `--machine N` | `KRAMER_MACHINE` | `1` | Protocol 2000 machine number |
 | `--host ADDR` | `KRAMER_HOST` | `0.0.0.0` | address **this service** listens on, not the matrix; `127.0.0.1` keeps it on this machine only |
 | `--port N` | `KRAMER_PORT` | `8000` | HTTP port for this service |
-| `--token STRING` | `KRAMER_TOKEN` | none | require this token on every request |
+| `--token STRING` | `KRAMER_TOKEN` | none | require this token on every request; the page is handed a cookie so the token is typed once |
 | `--allow-preset-changes` | `KRAMER_ALLOW_PRESET_CHANGES` | off | permit changing the hardware presets: overwriting one and emptying one |
 | `--allow-preset-store` | `KRAMER_ALLOW_PRESET_STORE` | off | **deprecated** alias for the row above; still honoured, logs a warning at startup |
 | `--allow-panel-lock` | `KRAMER_ALLOW_PANEL_LOCK` | off | permit **locking** the front panel; unlocking never needs it |
+| `--trust-proxy` | `KRAMER_TRUST_PROXY` | off | log the client address from `X-Forwarded-For` rather than the connecting one — only behind a reverse proxy |
 | `--heartbeat SECONDS` | `KRAMER_HEARTBEAT` | `30` | probe the matrix after this much silence; `0` disables the check |
 | `--config PATH` | `KRAMER_CONFIG` | see below | settings file to use |
 | `--version` | | | print the version and exit |
@@ -604,6 +606,13 @@ These are choices, not oversights:
 - **No authentication by default.** The service is meant for a network you trust. As printed at
   startup, **anyone who can reach the port can switch your monitors**. `--token STRING` requires
   that token on every request, sent either as `Authorization: Bearer STRING` or as `?token=STRING`.
+  Open the page once as `http://host:8000/?token=STRING` and it is handed the token back as a
+  cookie, then redirected to the same address without it — the token stays out of the address bar,
+  and so out of the history, the bookmarks and the next screenshot. The cookie is what every
+  request the page makes afterwards carries: `fetch()` could have sent the
+  header, but `EventSource` cannot send one at all, and putting the token in every URL writes it
+  into the browser history. The cookie is scoped to the path the page was served from, so a
+  service mounted under a prefix does not hand its token to whatever else lives on that host.
   Every request passes through a single gate, so a login page can be added there later without
   touching the routes.
 - **Do not expose this to the internet.** There is no TLS and no rate limiting. If you need access
@@ -675,6 +684,78 @@ Three notes worth having before you need them:
   from advice into an operational fact. While the container is running, the Tkinter GUI is the
   fallback for when it is stopped — not a second window. See
   [Run one controller at a time](#️-run-one-controller-at-a-time).
+
+### Behind a reverse proxy
+
+Both shapes work, and neither needs anything rebuilt:
+
+- **A host of its own** — `http://kramer.lab/` — needs that name to resolve on every client: a
+  record in the router's DNS, or a line in each machine's `hosts` file. That is the whole cost of
+  this shape, and it is paid once.
+- **A path under a host you already have** — `http://lab/kramer-controller/` — needs no DNS at
+  all, but asks two things of the proxy: **strip the prefix** before passing the request on, and
+  **redirect the address without the trailing slash** to the one with it.
+
+Everything the page asks for is a *relative* URL, which is what makes the second shape possible:
+the service never learns the prefix and never needs to. Both requirements above follow from that.
+A page opened at `/kramer-controller` without the slash resolves its own requests one level up, at
+`/api/...`, which is somebody else's 404. And the service answers `/api/state`, not
+`/kramer-controller/api/state`, so the prefix has to be gone by the time the request arrives.
+
+nginx, mounted under a path:
+
+```nginx
+location = /kramer-controller { return 301 /kramer-controller/; }
+
+location /kramer-controller/ {
+    proxy_pass http://127.0.0.1:8000/;   # this trailing slash is what strips the prefix
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_buffering off;
+    proxy_read_timeout 1h;
+}
+```
+
+On a host of its own it is the same block as `location /` inside a `server` with
+`server_name kramer.lab;`, and `proxy_pass http://127.0.0.1:8000;` *without* the trailing slash —
+there is no prefix to strip.
+
+Caddy, both shapes:
+
+```caddyfile
+http://kramer.lab {
+    reverse_proxy 127.0.0.1:8000 { flush_interval -1 }
+}
+
+http://lab {
+    redir /kramer-controller /kramer-controller/
+    handle_path /kramer-controller/* {
+        reverse_proxy 127.0.0.1:8000 { flush_interval -1 }
+    }
+}
+```
+
+`http://` in front of the name on purpose: without it Caddy goes looking for a certificate for a
+name that exists only on your LAN.
+
+**`proxy_buffering off`, or `flush_interval -1`, is the line to get right.** State arrives over
+Server-Sent Events — one response held open for as long as the tab is — and a buffering proxy
+holds those events back until its buffer fills. The page then loads, looks entirely correct, and
+never changes again: the failure looks like a broken matrix rather than a broken proxy. The stream
+sends a comment frame every 15 seconds, so any read timeout above that is enough; nginx's default
+60 s already is.
+
+Two more things worth setting. With `--trust-proxy` the log names the client from
+`X-Forwarded-For` instead of naming the proxy on every single line. Leave it off unless the
+service is reachable *only* through the proxy: that header is written by whoever sends the
+request, so a client that can still reach the port directly can write whatever it likes in it.
+Nothing here decides anything from the address, so the cost of a lie is a misleading log line and
+not a way in. And if `--token` is set, the first visit through the proxy is still
+`http://lab/kramer-controller/?token=STRING`. The redirect that takes the token back out of the
+address is relative, so it lands on the mount point rather than on the root of the host, and the
+cookie it hands back is scoped to `/kramer-controller/` — out of the way of anything else served
+under that name.
 
 ### Presets: overwriting them, and emptying them
 

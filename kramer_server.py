@@ -62,6 +62,7 @@ import socket
 import sys
 import threading
 import time
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -506,6 +507,9 @@ PRESET_RECALL = re.compile(r"^/api/preset/(\d+)/recall$")
 PRESET_STORE = re.compile(r"^/api/preset/(\d+)/store$")
 PRESET_DELETE = re.compile(r"^/api/preset/(\d+)/delete$")
 TOKEN_IN_QUERY = re.compile(r"token=[^&\s]*")
+SESSION_COOKIE = "kramer_token"
+SESSION_MAX_AGE = 30 * 24 * 3600   # seconds a browser keeps the cookie
+
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -513,6 +517,23 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     # ----- plumbing -------------------------------------------------------- #
+
+    def address_string(self):
+        """Behind a reverse proxy every request arrives from the proxy, so the
+        log would name it and nothing else - one address for the whole house.
+        With --trust-proxy the first entry of X-Forwarded-For is logged instead:
+        the client as the proxy saw it.
+
+        Off by default because that header is written by whoever sends the
+        request. Nothing here decides anything from the address, so a lie costs
+        a misleading log line and no more - but it is still a lie, so only turn
+        this on when the service is reachable through the proxy alone."""
+        if self.server.trust_proxy:
+            forwarded = self.headers.get("X-Forwarded-For", "")
+            first = forwarded.partition(",")[0].strip()
+            if first:
+                return first
+        return super().address_string()
 
     def log_message(self, fmt, *args):
         # The SSE stream is one long request; logging it once is enough.
@@ -527,15 +548,25 @@ class Handler(BaseHTTPRequestHandler):
         """Single gate for every request. There is no authentication by default,
         by choice: the service is meant for a trusted LAN. It exists so a token
         or a session cookie can be added here alone, without touching the routes.
-        Pass --token, or set KRAMER_TOKEN, to require ?token=... or an
-        Authorization: Bearer header."""
+        Pass --token, or set KRAMER_TOKEN, to require ?token=..., an
+        Authorization: Bearer header, or the cookie the page itself is given."""
         token = self.server.token
         if not token:
             return True
         header = self.headers.get("Authorization", "")
         if header.startswith("Bearer ") and header[7:] == token:
             return True
+        if self._cookie_token() == token:
+            return True
         return f"token={token}" in (self.path.partition("?")[2] or "")
+
+    def _cookie_token(self):
+        """A header the browser mangled parses to nothing rather than raising,
+        so it arrives here as a request carrying no usable token - which the
+        gate above refuses exactly as it refuses one carrying none at all."""
+        jar = SimpleCookie(self.headers.get("Cookie", ""))
+        morsel = jar.get(SESSION_COOKIE)
+        return morsel.value if morsel else None
 
     def _send(self, code, body=b"", content_type="application/json",
               extra_headers=()):
@@ -574,7 +605,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(401, "a token is required")
         path = self.path.partition("?")[0]
         if path in ("/", "/index.html"):
-            return self._serve_index()
+            return self._serve_index(path)
         if path == "/api/state":
             return self._json(200, self.server.state_payload())
         if path == "/api/labels":
@@ -636,12 +667,48 @@ class Handler(BaseHTTPRequestHandler):
 
     # ----- handlers -------------------------------------------------------- #
 
-    def _serve_index(self):
+    def _serve_index(self, path):
+        """A token in the address is answered with a redirect to the same page
+        without it. Left there it goes into the history, into a bookmark and
+        into the next screenshot; the cookie set on the way survives, because a
+        browser keeps cookies from a 303 like from any other answer.
+
+        The Location is relative for the same reason every path in the page is:
+        behind a reverse proxy this service is asked for / while the browser is
+        at /kramer-controller/, and an absolute Location would send it to the
+        root of the host instead. A browser that refuses the cookie does not
+        loop - the address it lands on carries no token, so it gets a plain 401
+        and says so."""
+        cookie = self._session_cookie()
+        if cookie and "token=" in (self.path.partition("?")[2] or ""):
+            here = path.rpartition("/")[2] or "./"
+            return self._send(303, extra_headers=cookie + (("Location", here),))
         try:
             body = INDEX.read_bytes()
         except OSError:
             return self._error(500, f"{INDEX.name} is missing next to the script")
-        self._send(200, body, "text/html; charset=utf-8")
+        self._send(200, body, "text/html; charset=utf-8", cookie)
+
+    def _session_cookie(self):
+        """The address of the page can carry a token - ?token=... - but nothing
+        the page then does can. fetch() could send an Authorization header,
+        EventSource cannot send one at all, and appending the token to every URL
+        writes it into the browser history and into any log the answer passes.
+        So the one request that does arrive with a token is handed a cookie, and
+        every request after it is let through by that - see _serve_index, which
+        then redirects the token out of the address bar.
+
+        No Path attribute, deliberately: the browser then scopes the cookie to
+        the directory it asked for, which behind a reverse proxy is the mount
+        point - /kramer-controller/ - rather than the whole host. Path=/ would
+        hand this token to every other app served under the same name. No
+        Secure either: this speaks plain HTTP on a LAN, by the same choice that
+        makes the token optional in the first place."""
+        if not self.server.token:
+            return ()
+        return (("Set-Cookie",
+                 f"{SESSION_COOKIE}={self.server.token}; "
+                 f"Max-Age={SESSION_MAX_AGE}; HttpOnly; SameSite=Lax"),)
 
     def _serve_events(self):
         """One long-lived response per browser. ThreadingHTTPServer gives this
@@ -871,13 +938,14 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, link, token=None, allow_preset_changes=False,
-                 allow_panel_lock=False):
+                 allow_panel_lock=False, trust_proxy=False):
         super().__init__(address, Handler)
         self.link = link
         self.hub = EventHub()
         self.token = token
         self.allow_preset_changes = allow_preset_changes
         self.allow_panel_lock = allow_panel_lock
+        self.trust_proxy = trust_proxy
 
     def handle_error(self, request, client_address):
         """A client that goes away is not an error, and must not be a traceback.
@@ -946,7 +1014,14 @@ def build_parser():
                     help="HTTP port for this service (env KRAMER_PORT, default 8000)")
     ap.add_argument("--token", default=kp.env_default("KRAMER_TOKEN"),
                     help="require this token on every request (env KRAMER_TOKEN; "
-                         "Authorization: Bearer, or ?token=)")
+                         "Authorization: Bearer, or ?token= - which the page "
+                         "then keeps in a cookie)")
+    ap.add_argument("--trust-proxy", action="store_true",
+                    default=kp.env_flag("KRAMER_TRUST_PROXY"),
+                    help="log the client address from X-Forwarded-For instead of "
+                         "the connecting one (env KRAMER_TRUST_PROXY=1). Only "
+                         "behind a reverse proxy: any client that can reach this "
+                         "service directly can put what it likes in that header")
     ap.add_argument("--allow-preset-changes", action="store_true",
                     default=kp.env_flag("KRAMER_ALLOW_PRESET_CHANGES"),
                     help="allow changing the hardware presets - overwriting one "
@@ -1004,7 +1079,8 @@ def main():
                       args.machine, heartbeat=args.heartbeat)
     try:
         server = Server((args.host, args.port), link, args.token,
-                        allow_preset_changes, args.allow_panel_lock)
+                        allow_preset_changes, args.allow_panel_lock,
+                        args.trust_proxy)
     except OSError as e:
         # Almost always the port being taken. A traceback here tells the reader
         # nothing they can act on, and this is the first thing that goes wrong.

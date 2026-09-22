@@ -10,6 +10,7 @@ can be exercised without hardware. Exits non-zero if any check fails.
 """
 
 import contextlib
+import http.client
 import io as _io
 import json
 import os
@@ -151,6 +152,21 @@ def request(method, path, body=None, headers=None, timeout=5):
 def raw_body(path, timeout=5):
     with urllib.request.urlopen(base + path, timeout=timeout) as res:
         return res.status, res.headers.get("Content-Type"), res.read()
+
+
+def unfollowed(path, headers=None, timeout=5):
+    """Status and headers of a GET, without chasing a redirect: urlopen() would
+    follow the 303 and hand back the answer to a different request, which is the
+    very thing under test. Returns (status, headers)."""
+    conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1],
+                                      timeout=timeout)
+    try:
+        conn.request("GET", path, headers=headers or {})
+        res = conn.getresponse()
+        res.read()
+        return res.status, res.headers
+    finally:
+        conn.close()
 
 
 # --- state ----------------------------------------------------------------- #
@@ -463,7 +479,68 @@ status, payload = request("GET", "/api/state",
 check("a bearer header is accepted", status, 200)
 status, payload = request("POST", "/api/route", {"input": 1, "output": 1})
 check("a command with no token is refused too", status, 401)
+
+# --- the token gate: the cookie the page is given -------------------------- #
+# The page can be opened with the token in its address, but nothing it then does
+# can carry one: EventSource sends no headers at all. So the page is handed a
+# cookie and redirected to its own address without the token.
+status, headers = unfollowed("/?token=s3cr3t")
+cookie = headers.get("Set-Cookie", "")
+check("a token in the address is redirected away", status, 303)
+check("to the same page, relatively - the prefix behind a proxy is not ours",
+      headers.get("Location"), "./")
+check("and the cookie is set on the way",
+      cookie.startswith("kramer_token=s3cr3t;"), True)
+check("with no Path, so the browser scopes it to the mount point",
+      "Path=" in cookie, False)
+check("and out of reach of the page's own scripts", "HttpOnly" in cookie, True)
+
+status, headers = unfollowed("/index.html?token=s3cr3t")
+check("the redirect keeps the page it was asked for",
+      headers.get("Location"), "index.html")
+
+status, headers = unfollowed("/", headers={"Cookie": "kramer_token=s3cr3t"})
+check("and the page is served once the token is out of the address", status, 200)
+status, payload = request("GET", "/api/state",
+                          headers={"Cookie": "kramer_token=s3cr3t"})
+check("the cookie is accepted on the API too", status, 200)
+status, payload = request("GET", "/api/state",
+                          headers={"Cookie": "kramer_token=wrong"})
+check("a wrong cookie is refused", status, 401)
+# A browser that mangles the header, or a proxy that rewrites it: parsing it
+# yields nothing rather than raising, and nothing is refused like an absent one.
+status, payload = request("GET", "/api/state", headers={"Cookie": "kramer_token"})
+check("a malformed cookie is a 401, not a crash", status, 401)
+
 server.token = None
+status, headers = unfollowed("/")
+check("no token configured, no cookie", "Set-Cookie" in headers, False)
+
+# --- behind a reverse proxy ------------------------------------------------ #
+# Without --trust-proxy every line of the log would name the proxy. With it, the
+# first hop of X-Forwarded-For is logged instead - the client as the proxy saw
+# it. log() prints to stdout, hence the redirect here.
+forwarded = {"X-Forwarded-For": "10.0.0.7, 10.0.0.1"}
+
+
+def logged(headers):
+    captured = _io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        request("GET", "/api/state", headers=headers)
+    return captured.getvalue()
+
+
+check("the connecting address is logged by default",
+      "127.0.0.1" in logged(forwarded), True)
+check("and the forwarded one is ignored", "10.0.0.7" in logged(forwarded), False)
+server.trust_proxy = True
+check("with --trust-proxy the first hop is logged instead",
+      "10.0.0.7" in logged(forwarded), True)
+check("a request without the header still names the peer",
+      "127.0.0.1" in logged(None), True)
+check("and so does one with the header empty",
+      "127.0.0.1" in logged({"X-Forwarded-For": ""}), True)
+server.trust_proxy = False
 
 # --- options: the environment supplies defaults, flags win ----------------- #
 # The environment is read when build_parser() runs, because that is when the
@@ -493,6 +570,9 @@ check("a blank variable is not a value", parse([], KRAMER_PORT="").port, 8000)
 check("the matrix address comes from the environment too",
       parse([], KRAMER_MATRIX="10.0.0.5:10001").matrix, "10.0.0.5:10001")
 check("so does the token", parse([], KRAMER_TOKEN="abc").token, "abc")
+check("the proxy switch is off unless asked for", parse([]).trust_proxy, False)
+check("and the environment can ask for it",
+      parse([], KRAMER_TRUST_PROXY="1").trust_proxy, True)
 check("and the heartbeat", parse([], KRAMER_HEARTBEAT="5").heartbeat, 5.0)
 check("preset changes can be enabled by the environment",
       parse([], KRAMER_ALLOW_PRESET_CHANGES="1").allow_preset_changes, True)

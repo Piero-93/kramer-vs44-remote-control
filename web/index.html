@@ -384,7 +384,7 @@ async function saveLabel(key, index, value) {
   if (labels[key][index] === clean) return;     // nothing to write
   const next = [...labels[key]];
   next[index] = clean;
-  const res = await send("PUT", "/api/labels", { [key]: next });
+  const res = await send("PUT", "api/labels", { [key]: next });
   if (res) {
     labels = res;
     renderAll();
@@ -548,7 +548,7 @@ function updatePresetPanel(n) {
 }
 
 async function recall(n) {
-  const res = await send("POST", `/api/preset/${n}/recall`);
+  const res = await send("POST", `api/preset/${n}/recall`);
   if (res) { state = res; renderAll(); }
 }
 
@@ -563,7 +563,7 @@ async function storePreset(n) {
     (occupied ? `"${name}" already holds a layout and it will be lost.`
               : `"${name}" is currently empty.`);
   if (!confirm(message)) return;
-  const res = await send("POST", `/api/preset/${n}/store`);
+  const res = await send("POST", `api/preset/${n}/store`);
   if (res) {
     state = res;
     renderAll();
@@ -579,7 +579,7 @@ async function deletePreset(n) {
       `Empty "${name}"?\n\n` +
       "What the slot holds is discarded and cannot be recovered.\n" +
       "The routing on the outputs is not changed.")) return;
-  const res = await send("POST", `/api/preset/${n}/delete`);
+  const res = await send("POST", `api/preset/${n}/delete`);
   if (res) {
     state = res;
     renderAll();
@@ -629,7 +629,7 @@ async function setLock(locked) {
       "The buttons on the matrix itself stop working until it is unlocked. " +
       "Anyone standing at the machine will not be able to use it, and the only " +
       "way back is this page or another controller.")) return;
-  const res = await send("POST", "/api/lock", { locked });
+  const res = await send("POST", "api/lock", { locked });
   if (res) {
     state = res;
     renderAll();
@@ -658,6 +658,13 @@ function toast(message) {
 
 /* ---------- talking to the service -------------------------------------- */
 
+// Every path passed here is relative on purpose. A leading slash would ignore
+// the prefix a reverse proxy mounts this under, so a page served at
+// /kramer-controller/ would call /api/route and get the proxy's 404. Relative
+// paths resolve against the page's own address and work either way - at the
+// root of a host, or under a path this service never learns about. The mount
+// point has to end in a slash for that: /kramer-controller without one
+// resolves one level up, so the proxy must redirect it.
 async function send(method, path, body) {
   busy = true;
   renderAll();
@@ -680,7 +687,7 @@ async function send(method, path, body) {
 }
 
 async function route(input, output) {
-  const res = await send("POST", "/api/route", { input, output });
+  const res = await send("POST", "api/route", { input, output });
   if (res) { state = res; renderAll(); }
 }
 
@@ -689,7 +696,7 @@ async function route(input, output) {
 function listen() {
   // EventSource reconnects on its own, so a service restart or a flaky network
   // needs no handling here beyond showing that the stream is down.
-  const stream = new EventSource("/api/events");
+  const stream = new EventSource("api/events");
   stream.onopen = () => { streamUp = true; renderLink(); };
   stream.onmessage = (event) => {
     streamUp = true;
@@ -713,7 +720,7 @@ function listen() {
 window.onerror = (message, _src, line) => { toast(`page error: ${message} (line ${line})`); };
 
 (async function start() {
-  const got = await send("GET", "/api/labels");
+  const got = await send("GET", "api/labels");
   if (got) labels = got;
   renderAll();
   listen();

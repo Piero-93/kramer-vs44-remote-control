@@ -46,6 +46,12 @@ services:
       # variable, so do not reuse a password you care about.
       # KRAMER_TOKEN: "something-long-and-uninteresting"
 
+      # Only behind a reverse proxy: log the client from X-Forwarded-For
+      # instead of logging the proxy for every request. Off unless the
+      # service is unreachable except through the proxy - the header is
+      # written by whoever sends the request.
+      # KRAMER_TRUST_PROXY: "1"
+
       # Only on the day you set your presets up. Overwriting a preset and
       # emptying one are the only destructive operations this service exposes,
       # which is why they are off by default. Both are behind this one variable:

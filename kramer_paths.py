@@ -40,7 +40,7 @@ import os
 import sys
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 CONFIG_NAME = "kramer_gui_config.json"
 CONFIG_ENV = "KRAMER_CONFIG"

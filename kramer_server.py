@@ -97,6 +97,17 @@ DEFAULT_LABELS = {
 
 INDEX = kp.resource_path("web", "index.html")
 
+# What makes the page installable as an app. A fixed table, never a path built from
+# the request. Served without the token check: the browser fetches the manifest and
+# the icons itself, without the session cookie, and they carry nothing private.
+INSTALL_FILES = {
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+    "/icons/icon.svg": ("icons/icon.svg", "image/svg+xml"),
+    "/icons/icon-192.png": ("icons/icon-192.png", "image/png"),
+    "/icons/icon-512.png": ("icons/icon-512.png", "image/png"),
+    "/icons/maskable-512.png": ("icons/maskable-512.png", "image/png"),
+}
+
 SSE_KEEPALIVE = 15.0            # seconds between SSE comment frames
 SSE_BACKLOG = 32                # events buffered per browser before dropping
 
@@ -601,9 +612,11 @@ class Handler(BaseHTTPRequestHandler):
     # ----- routing --------------------------------------------------------- #
 
     def do_GET(self):
+        path = self.path.partition("?")[0]
+        if path in INSTALL_FILES:
+            return self._serve_install_file(path)
         if not self._authorized():
             return self._error(401, "a token is required")
-        path = self.path.partition("?")[0]
         if path in ("/", "/index.html"):
             return self._serve_index(path)
         if path == "/api/state":
@@ -688,6 +701,14 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             return self._error(500, f"{INDEX.name} is missing next to the script")
         self._send(200, body, "text/html; charset=utf-8", cookie)
+
+    def _serve_install_file(self, path):
+        name, content_type = INSTALL_FILES[path]
+        try:
+            body = kp.resource_path("web", *name.split("/")).read_bytes()
+        except OSError:
+            return self._error(500, f"{name} is missing next to the script")
+        self._send(200, body, content_type)
 
     def _session_cookie(self):
         """The address of the page can carry a token - ?token=... - but nothing

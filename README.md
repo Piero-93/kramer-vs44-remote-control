@@ -757,6 +757,22 @@ address is relative, so it lands on the mount point rather than on the root of t
 cookie it hands back is scoped to `/kramer-controller/` — out of the way of anything else served
 under that name.
 
+### Installing the page as an app
+
+The page ships a web app manifest, so Chrome can install it: it then opens from the home screen
+or the app launcher in its own window, without the address bar. `start_url` and `scope` are
+relative, like every other URL in the page, so it installs the same on a host of its own and
+under a path. There is **no service worker**: the state lives on the matrix, and an installed
+page with no connection would have nothing to show.
+
+**Chrome offers "Install app" only from a secure context** — `https://`, or `localhost`. Behind
+a proxy that speaks plain `http://`, as in the examples above, you get "Add to Home screen"
+instead, which makes a shortcut that still opens with the browser's bar. For the real install
+the proxy has to serve the name over HTTPS, with a certificate the device trusts.
+
+The manifest and the icons are the one thing served without `--token`: the browser asks for them
+by itself, without the session cookie, and they carry nothing private.
+
 ### Presets: overwriting them, and emptying them
 
 Recalling a preset is a single tap and always available. **Storing** and **emptying** are

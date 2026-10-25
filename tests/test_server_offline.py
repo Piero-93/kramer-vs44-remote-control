@@ -512,6 +512,26 @@ check("a wrong cookie is refused", status, 401)
 status, payload = request("GET", "/api/state", headers={"Cookie": "kramer_token"})
 check("a malformed cookie is a 401, not a crash", status, 401)
 
+# The browser fetches the manifest and the icons itself, with no cookie, so they
+# are served to a request that carries no token - and only they are.
+manifest_status, manifest_type, manifest_raw = raw_body("/manifest.webmanifest")
+check("the manifest needs no token", manifest_status, 200)
+check("and is served as a manifest", manifest_type, "application/manifest+json")
+manifest = json.loads(manifest_raw)
+check("it opens as an app, not as a tab", manifest["display"], "standalone")
+check("with relative start_url and scope, for a mount point behind a proxy",
+      (manifest["start_url"], manifest["scope"]), ("./", "./"))
+for icon in manifest["icons"]:
+    icon_status, icon_type, icon_raw = raw_body("/" + icon["src"])
+    check(f"{icon['src']} is served without a token", (icon_status, icon_type),
+          (200, icon["type"]))
+    check(f"{icon['src']} is a PNG", icon_raw[:8], b"\x89PNG\r\n\x1a\n")
+check("the page links the manifest",
+      '<link rel="manifest" href="manifest.webmanifest">' in ks.INDEX.read_text(
+          encoding="utf-8"), True)
+status, payload = request("GET", "/icons/../kramer_server.py")
+check("only the listed files are served", status, 401)
+
 server.token = None
 status, headers = unfollowed("/")
 check("no token configured, no cookie", "Set-Cookie" in headers, False)

@@ -1088,7 +1088,7 @@ Maximum 64 characters per string. Commands can be concatenated with `|`.
 | `#LOCK-FP 0\|1` / `#LOCK-FP?` | front-panel lock |
 | `#IDV` | visual identification (blinks) |
 | `#HELP` | list supported commands |
-| `#CPEDID` `#GETEDID` `#GETEDIDEXT` | EDID management |
+| `#CPEDID` `#GEDID` `#GEDID-EXT` `#LDEDID` | EDID management — listed, but see the note below |
 | `#RESET` | reboot (clears nothing) |
 | `#P2000` | switch back to Protocol 2000 |
 | `#FACTORY` | **DESTRUCTIVE** — wipes the entire configuration |
@@ -1113,6 +1113,20 @@ protocol 3000:1.08) by asking the device itself with `#HELP` and then trying eac
 
 So `*` works for `#VID?` and for nothing else, and `#PRST-VID?` cannot be made to answer at all:
 on this firmware a preset's contents cannot be read back from the device.
+
+**The EDID commands are listed, but the ones tried do not answer.** `#HELP` names them `CPEDID`,
+`GEDID`, `GEDID-EXT` and `LDEDID`; the `GETEDID` spellings get `~01@ERR002`. Every form of `CPEDID`
+and `GEDID` the Protocol 3000 reference documents was refused on the same unit. `LDEDID`, a
+multi-step packet upload, was not tried.
+
+| Sent | Reply |
+|---|---|
+| `#CPEDID 1,1,0,0x4` and `0x0004`, `0x00000004`, `4`, `0X4`, with spaces after the commas, with a fifth `safe_mode` field | `~01@CPEDID ERR001` |
+| `#GEDID 0,3`, `#GEDID 1,1`, `#GEDID 0,3,256` | `~01@GEDID ERR001` |
+| `#GEDID? 0,3`, `#GEDID? 1,1` | `~01@ERR002` |
+
+The VS-44HN manual documents none of them. EDID is managed from the front panel
+(`EDID` + `STO`, then the input, the output, and `EDID` again), and that path works.
 
 ### Constants in the code
 

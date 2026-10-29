@@ -103,6 +103,12 @@
     padding: .35rem .4rem; width: 100%; min-width: 4.5rem;
   }
   th input.name { font-size: .85rem; color: var(--muted); font-weight: 500; }
+
+  /* Whether a source is sending to the input. Empty when that is not known -
+     the link is down, the reading is off, or it has not happened yet - so a
+     dot never claims more than the service does. */
+  .sig { display: block; font-size: .75rem; color: var(--muted); min-height: 1.1em; }
+  .sig.yes { color: var(--accent); }
   td.out input.name { text-align: left; }
   input.name:hover { border-color: var(--line); }
   input.name:focus {
@@ -289,12 +295,16 @@ function buildGrid() {
   head.textContent = "";
   head.appendChild(th("output \\ input", "out"));
 
-  const inputNames = [];
+  const inputNames = [], signals = [];
   for (let i = 1; i <= N_IO; i++) {
     const cell = document.createElement("th");
     const field = nameField("inputs", i - 1);
     cell.appendChild(field);
     inputNames.push(field);
+    const sig = document.createElement("span");
+    sig.className = "sig";
+    cell.appendChild(sig);
+    signals.push(sig);
     head.appendChild(cell);
   }
   head.appendChild(th("off"));
@@ -320,13 +330,23 @@ function buildGrid() {
     tr.appendChild(wrap(disconnect));
     body.appendChild(tr);
   }
-  grid = { inputNames, outputNames, buttons };
+  grid = { inputNames, outputNames, buttons, signals };
 }
 
 function renderGrid() {
   if (!grid) buildGrid();
   setFieldValues(grid.inputNames, "inputs");
   setFieldValues(grid.outputNames, "outputs");
+  grid.signals.forEach((el, k) => {
+    // null and a missing key alike mean "not known", and show nothing.
+    const has = state.connected ? (state.signals || {})[k + 1] : null;
+    const known = has === true || has === false;
+    el.className = "sig" + (has === true ? " yes" : "");
+    el.textContent = !known ? "" : has ? "● signal" : "○ no signal";
+    el.title = !known ? "" : has
+      ? `A source is sending to ${labels.inputs[k]}`
+      : `Nothing is sending to ${labels.inputs[k]}`;
+  });
   for (const { b, input, output } of grid.buttons) {
     b.disabled = busy || !state.connected;
     b.classList.toggle("on", Number(state.routing[output]) === input);

@@ -353,7 +353,10 @@ class Protocol2000:
         return bool(f[0]["output"]) if f else None
 
     def signal(self, inp):
-        """Instruction 15 with output=1: is a valid input detected?"""
+        """Instruction 15 with output=1: is a valid input detected?
+
+        Measured on a VS-44HN, firmware 3.3: a PC switched on answers 1, one in
+        standby answers 0, and an input number out of range is refused (None)."""
         f = self._cmd(15, inp=inp, out=1)
         return bool(f[0]["output"]) if f else None
 

@@ -38,7 +38,8 @@ RUN ONE CONTROLLER AT A TIME
 Endpoints
 ---------
   GET  /                      the web UI
-  GET  /api/state             connection state and current routing
+  GET  /api/state             connection state, current routing and which
+                              inputs carry a signal
   GET  /api/labels            input, output and preset names
   PUT  /api/labels            update those names
   POST /api/route             {"input": n, "output": m}
@@ -164,8 +165,10 @@ class DeviceLink:
     IDLE_POLL = 0.2                 # seconds spent listening between jobs
     RECONNECT_DELAY = kv.RECONNECT_DELAY
     HEARTBEAT = kv.HEARTBEAT
+    SIGNAL_INTERVAL = 60.0          # seconds between two reads of the inputs
 
-    def __init__(self, host, port, machine=1, on_change=None, heartbeat=None):
+    def __init__(self, host, port, machine=1, on_change=None, heartbeat=None,
+                 signal_interval=None):
         self.host, self.port, self.machine = host, port, machine
         # When to probe and whether it answered lives in kramer_vs44, shared with
         # the GUI: it is the same decision, and two copies of it would drift.
@@ -183,6 +186,17 @@ class DeviceLink:
         # inferred by comparing the routing against remembered contents, because
         # the device cannot be asked what a preset holds.
         self.active_preset = None
+        # {input: bool}, read by polling because the matrix announces nothing
+        # when a source comes or goes. An input missing from it is "not known",
+        # and every input is missing while the link is down: the last reading
+        # of a matrix nobody can reach is not a reading.
+        self.signals = {}
+        self.signal_interval = (self.SIGNAL_INTERVAL if signal_interval is None
+                                else signal_interval)
+        # Inputs still to read in the round in progress, and when the next
+        # round is due. See _maybe_read_signal.
+        self._signal_round = []
+        self._signal_next = 0.0
         self.connected = False
         self.detail = f"TCP {host}:{port}"
         self.error = None
@@ -264,6 +278,8 @@ class DeviceLink:
             "presets": {str(n): v for n, v in sorted(self.presets.items())},
             "active_preset": self.active_preset,
             "locked": self.locked,
+            "signals": {str(i): self.signals.get(i) if self.connected else None
+                        for i in range(1, N_IO + 1)},
             "error": self.error,
         }
 
@@ -280,6 +296,7 @@ class DeviceLink:
                 self._listen()
                 self._maybe_resync()
                 self._maybe_beat()
+                self._maybe_read_signal()
                 continue
             try:
                 # No mark_ok here on purpose: whether the device answered is
@@ -401,6 +418,43 @@ class DeviceLink:
         if reason:
             self._drop(reason)
 
+    def _maybe_read_signal(self):
+        """Ask one input whether a source is sending to it, once a round is due.
+
+        One input per idle pass, not four in a row: the matrix has no form that
+        answers for every input at once, and four commands back to back would
+        hold a switch from a browser for most of a second behind a read nobody
+        is waiting for. Spread like this, a job waits for one command at most.
+
+        Nothing here touches the liveness timer. A reply is bytes arriving, so
+        the transport has already recorded it as proof of life, exactly as it
+        does for every other answer; a read that got no reply leaves the timer
+        where it was, so the probe still comes due for a matrix gone silent."""
+        if self.signal_interval <= 0 or not self._proto:
+            return
+        if not self._signal_round:
+            if time.monotonic() < self._signal_next:
+                return
+            self._signal_round = list(range(1, N_IO + 1))
+            self._signal_next = time.monotonic() + self.signal_interval
+        inp = self._signal_round.pop(0)
+        try:
+            # True or False from a reply; None when the device refused the
+            # question or did not answer, which is "not known" and shown so.
+            value = self._proto.signal(inp)
+        except OSError as e:
+            self._drop(e)
+            return
+        before = self.signals.get(inp)
+        if value == before:
+            return
+        self.signals[inp] = value
+        # Only a change between two readings is news. The first reading after
+        # a connect would otherwise put four lines in the log every time.
+        if before is not None and value is not None:
+            log(f"input {inp}: signal {'present' if value else 'gone'}")
+        self.on_change()
+
     def _notified(self, frames):
         """Called on this thread by Protocol2000 for frames the matrix sent by
         itself. SWITCH VIDEO carries routing, STORE PRESET carries occupancy,
@@ -470,6 +524,11 @@ class DeviceLink:
         self._transport = None
         self._proto = None
         self.connected = False
+        # Read again from scratch on the next connection, at once: a source
+        # may have come or gone while nobody was able to ask.
+        self.signals = {}
+        self._signal_round = []
+        self._signal_next = 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -1073,6 +1132,14 @@ def build_parser():
                     help=f"probe the matrix after this much silence (env "
                          f"KRAMER_HEARTBEAT, default {DeviceLink.HEARTBEAT:g}; "
                          f"0 disables the check)")
+    ap.add_argument("--signal-interval", type=float,
+                    default=kp.env_default("KRAMER_SIGNAL_INTERVAL",
+                                           str(DeviceLink.SIGNAL_INTERVAL)),
+                    metavar="SECONDS",
+                    help=f"read which inputs carry a signal this often (env "
+                         f"KRAMER_SIGNAL_INTERVAL, default "
+                         f"{DeviceLink.SIGNAL_INTERVAL:g}; 0 disables it, and "
+                         f"the API then reports every input as unknown)")
     kp.add_common_arguments(ap)
     return ap
 
@@ -1097,7 +1164,8 @@ def main():
 
     host, _, port = args.matrix.partition(":")
     link = DeviceLink(host, int(port) if port else kv.DEFAULT_TCP_PORT,
-                      args.machine, heartbeat=args.heartbeat)
+                      args.machine, heartbeat=args.heartbeat,
+                      signal_interval=args.signal_interval)
     try:
         server = Server((args.host, args.port), link, args.token,
                         allow_preset_changes, args.allow_panel_lock,
@@ -1146,6 +1214,9 @@ def main():
     if not args.heartbeat:
         log("liveness checking is disabled: a matrix switched off silently will "
             "still be reported as connected")
+    if args.signal_interval <= 0:
+        log("input signal reading is disabled: /api/state reports every input "
+            "as unknown")
     log("run only one controller at a time - see the README")
 
     # A container is stopped with SIGTERM, whose default disposition kills the

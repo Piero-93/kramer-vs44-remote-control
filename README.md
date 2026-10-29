@@ -154,7 +154,7 @@ needs nothing but Python.
 Verify what you downloaded against `SHA256SUMS.txt` on the release:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\kramer-gui-v0.6.0-windows-amd64.exe
+Get-FileHash -Algorithm SHA256 .\kramer-gui-v0.6.1-windows-amd64.exe
 ```
 
 ```bash

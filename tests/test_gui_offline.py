@@ -342,7 +342,7 @@ check("heartbeat 0 disables it", w.proto.pings, 0)
 # same period as it probes, so if a job that returned nothing counted as proof
 # of life the probe would never fire at all.
 w = linked(answer=[], heard_ago=1000)
-w.transport.last_rx = 0.0
+w.transport.last_rx = g.kv.NEVER
 check("a read that answered nothing does not postpone the probe",
       w.monitor.due(w.transport), True)
 

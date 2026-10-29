@@ -64,6 +64,7 @@ BAUD = 9600                      # identical for both protocols on the VS-44HN
 
 HEARTBEAT = 30.0                 # silence tolerated before probing a link
 RECONNECT_DELAY = 3.0            # pause before retrying a failed connection
+NEVER = float("-inf")            # a monotonic timestamp for "has not happened"
 
 # Protocol 2000 instruction 16: the device's ERROR reply. It is what comes back
 # instead of an echo when a command is refused - recalling an empty preset, for
@@ -91,7 +92,10 @@ class Transport:
         # When the device last actually said something. Recorded here rather than
         # by callers because it is the only honest measure of the link being
         # alive: a command can return without the device having answered at all.
-        self.last_rx = 0.0
+        # Minus infinity for "never", not 0.0: monotonic time starts near zero
+        # at boot, so on a machine up for less than a heartbeat a zero would
+        # read as "heard from just now".
+        self.last_rx = NEVER
 
     def _throttle(self):
         delta = time.monotonic() - self._last_tx
@@ -518,7 +522,7 @@ class LinkMonitor:
 
     def __init__(self, heartbeat=None):
         self.heartbeat = HEARTBEAT if heartbeat is None else heartbeat
-        self._last_ok = 0.0
+        self._last_ok = NEVER            # see Transport.last_rx
         self._logged_error = None
 
     def mark_ok(self):
@@ -530,7 +534,7 @@ class LinkMonitor:
 
     def silent_for(self, transport):
         """Seconds since the device last demonstrated it was there."""
-        heard = max(self._last_ok, getattr(transport, "last_rx", 0.0))
+        heard = max(self._last_ok, getattr(transport, "last_rx", NEVER))
         return time.monotonic() - heard
 
     def due(self, transport):

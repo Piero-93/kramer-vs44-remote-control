@@ -211,9 +211,9 @@ check("an answer in the same read still wins",
 
 # --- the transport records when the device last said something ------------- #
 t = transport_with([None])
-check("nothing heard yet", t.last_rx, 0.0)
+check("nothing heard yet", t.last_rx, kv.NEVER)
 t.recv(timeout=0.2, maxlen=64)
-check("a read with no data leaves it alone", t.last_rx, 0.0)
+check("a read with no data leaves it alone", t.last_rx, kv.NEVER)
 
 t = transport_with([bytes([0x41, 0x82, 0x83, 0x81])])
 t.recv(timeout=0.2, maxlen=64, expect=4)
@@ -251,6 +251,17 @@ check("a heartbeat of 0 disables probing", kv.LinkMonitor(0).due(Heard(1000)),
       False)
 check("no transport at all still counts as silence",
       kv.LinkMonitor().due(None), True)
+
+# Monotonic time starts near zero at boot, and a CI runner can be seconds old.
+# "Never" used to be 0.0, which on such a machine read as "heard just now" and
+# failed the two checks above on a release build. Pinned here on purpose.
+real_monotonic = time.monotonic
+time.monotonic = lambda: 5.0
+try:
+    check("on a machine booted seconds ago, silence is still silence",
+          kv.LinkMonitor().due(kv.Transport()), True)
+finally:
+    time.monotonic = real_monotonic
 
 # mark_ok is the other source of proof: a connection that has just proved itself
 # has not received anything yet.

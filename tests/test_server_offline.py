@@ -855,7 +855,7 @@ check("and the link is left alone", dl.connected, True)
 # {1: None, 2: None, ...} from a state read, and a program that reads as often as
 # it probes would otherwise never probe at all.
 dl = beat_link([])
-dl._transport.last_rx = 0.0          # nothing has ever arrived
+dl._transport.last_rx = ks.kv.NEVER   # nothing has ever arrived
 check("a silent link is still due for a probe",
       dl.monitor.due(dl._transport), True)
 dl._maybe_beat()

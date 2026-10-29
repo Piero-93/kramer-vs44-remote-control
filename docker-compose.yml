@@ -52,6 +52,10 @@ services:
       # written by whoever sends the request.
       # KRAMER_TRUST_PROXY: "1"
 
+      # How often to ask which inputs carry a signal, in seconds; 0 turns it
+      # off and /api/state then reports every input as unknown.
+      # KRAMER_SIGNAL_INTERVAL: "60"
+
       # Only on the day you set your presets up. Overwriting a preset and
       # emptying one are the only destructive operations this service exposes,
       # which is why they are off by default. Both are behind this one variable:

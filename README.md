@@ -75,7 +75,8 @@ factory default) and the ASCII **Protocol 3000** — so you never have to reach 
 - **GUI**: routing grid, named presets, editable input/output labels, live TX/RX byte log.
 - **Web service**: an HTTP API and a browser UI, so the matrix can be driven from a phone with
   nothing installed on it. Front-panel presses are pushed to the page over Server-Sent Events, and
-  the connection to the matrix is re-established by itself if it drops. Ships as a **container
+  the connection to the matrix is re-established by itself if it drops. Reports which inputs carry
+  a signal, for an automation that wants to know whether anything is actually on. Ships as a **container
   image** for installing as a service, configured entirely through environment variables.
 - **No dependencies at all** for TCP, GUI and web use — Tkinter and `http.server` ship with Python,
   and the browser UI is one self-contained HTML file with no framework and no build step.
@@ -561,6 +562,34 @@ because from its side the old connection was never closed either and still
 occupied a slot. Nothing is wrong if the log repeats `failed: timed out` for a
 minute or two.
 
+### Which inputs carry a signal
+
+`GET /api/state` includes `"signals": {"1": true, "2": false, ...}`, and the page shows it under
+each input's name. **"Signal" means what the matrix itself means by it**: whether a source is
+actually sending video into that input — Protocol 2000 instruction 15 with OUTPUT `1`, the same
+question as `#SIGNAL? <in>` in Protocol 3000. It says nothing about whether that input is routed
+anywhere, and nothing about what is on the screen.
+
+Measured on a VS-44HN, firmware 3.3, with a PC switched on behind inputs 3 and 4 and one **in
+standby** behind 1 and 2: 3 and 4 report a signal, 1 and 2 do not — whether routed to an output or
+not. A sleeping source therefore counts as no source, which is what makes the field usable for
+"the matrix has been on for ten minutes with nothing plugged in doing anything". A source switched
+off or unplugged was not measured; there is no reason to expect it to look *more* alive than one in
+standby.
+
+The matrix announces nothing when a source comes or goes, so this is the one thing the service
+polls: every `--signal-interval` seconds (default 60) it asks the four inputs in turn, **one input
+per idle pass** of the device thread rather than four commands in a row, so a switch from a browser
+waits behind one command at most. A change is pushed on the event stream like any other. Each reply
+is bytes from the device, so it counts as proof of life exactly as every other answer does, and the
+liveness probe simply has less to do; a read that gets no reply leaves the probe to come due as
+usual.
+
+`null` means **not known**, and it is used honestly: before the first reading, for an input the
+device refused to answer about, with the reading switched off, and for every input while the link is
+down — the last reading of a matrix nobody can reach is not a reading. After a reconnect the inputs
+are read again straight away.
+
 ### Options
 
 | Flag | Environment | Default | Meaning |
@@ -575,6 +604,7 @@ minute or two.
 | `--allow-panel-lock` | `KRAMER_ALLOW_PANEL_LOCK` | off | permit **locking** the front panel; unlocking never needs it |
 | `--trust-proxy` | `KRAMER_TRUST_PROXY` | off | log the client address from `X-Forwarded-For` rather than the connecting one — only behind a reverse proxy |
 | `--heartbeat SECONDS` | `KRAMER_HEARTBEAT` | `30` | probe the matrix after this much silence; `0` disables the check |
+| `--signal-interval SECONDS` | `KRAMER_SIGNAL_INTERVAL` | `60` | read which inputs carry a signal this often; `0` disables it, and every input is then reported as unknown |
 | `--config PATH` | `KRAMER_CONFIG` | see below | settings file to use |
 | `--version` | | | print the version and exit |
 
@@ -860,7 +890,7 @@ memory and silently lost, because a rename that evaporates on restart is worse t
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "presets", "active_preset", "locked", "error", "allow_preset_changes", "allow_panel_lock"}`; `routing` maps output to input with `0` meaning disconnected, `presets` maps slot to whether it holds a layout, `active_preset` is the slot the routing came from and is `null` when that is not known, `locked` is the front panel and is `null` when it has not been read. `allow_preset_store` is still sent as a deprecated alias of `allow_preset_changes`, so a page loaded before an upgrade keeps working |
+| `GET` | `/api/state` | `{"connected", "detail", "protocol", "routing", "presets", "active_preset", "locked", "signals", "error", "allow_preset_changes", "allow_panel_lock"}`; `routing` maps output to input with `0` meaning disconnected, `presets` maps slot to whether it holds a layout, `active_preset` is the slot the routing came from and is `null` when that is not known, `locked` is the front panel and is `null` when it has not been read, `signals` maps each input to whether a source is sending to it and is `null` per input when that is not known — see [Which inputs carry a signal](#which-inputs-carry-a-signal). `allow_preset_store` is still sent as a deprecated alias of `allow_preset_changes`, so a page loaded before an upgrade keeps working |
 | `GET` | `/api/labels` | input, output and preset names |
 | `PUT` | `/api/labels` | any subset of `inputs`, `outputs`, `presets`; returns the complete set |
 | `POST` | `/api/route` | `{"input": 0-4, "output": 0-4}`; input `0` disconnects, output `0` means every output |
@@ -986,6 +1016,7 @@ byte4 = 1 OVR X M4..M0  machine number (1 -> 0x81)
 | DELETE PRESET | 3 | preset 1 = `03 81 81 81` (OUTPUT `1` = delete) |
 | RECALL PRESET | 4 | preset 1 = `04 81 80 81` |
 | REQUEST STATUS OUTPUT | 5 | output 1 = `05 80 81 81` |
+| PRESET DEFINED? / SIGNAL? | 15 | preset 1 = `0F 81 80 81`, signal on input 3 = `0F 83 81 81` |
 | ERROR (from the device) | 16 | refusal = `50 80 80 81` |
 | LOCK FRONT PANEL | 30 | lock = `1E 81 80 81` |
 | CHANGE TO ASCII (→P3000) | 56 | `38 80 83 81` |
@@ -1001,7 +1032,9 @@ Replies come back in the same 4-byte format with the DESTINATION bit set (`0x40`
 `7D 80 AC 81`), `3D 83 80 81` (software version → `7D 83 83 81`, i.e. 3.3), `3E 8n 81 81`
 (define machine → 4 inputs, 4 outputs, 8 presets), `05 80 8n 81` (output status), `0F 8n 80 81`
 (instruction 15, is preset *n* defined → the OUTPUT field of the reply is 1 for an occupied slot and
-0 for an empty one, cross-checked against a unit with exactly one preset saved).
+0 for an empty one, cross-checked against a unit with exactly one preset saved), `0F 8n 81 81`
+(instruction 15 with OUTPUT 1, does input *n* carry a signal → `4F 83 81 81` with a PC switched on,
+`4F 81 80 81` with one in standby; input 9 is refused with `50 80 82 81`).
 
 `1E 81 80 81` (front-panel lock) was the last sequence still derived from the bit layout alone.
 It is now confirmed too: it replies `5E 81 80 81`, after which instruction 31 reports the panel
@@ -1139,6 +1172,7 @@ The VS-44HN manual documents none of them. EDID is managed from the front panel
 | `BAUD` | `9600` | same for both protocols |
 | `P2000_TO_P3000` | `38 80 83 81` | instruction 56 |
 | `HEARTBEAT` | `30.0` | silence tolerated before probing a link, shared by both programs |
+| `DeviceLink.SIGNAL_INTERVAL` | `60.0` | service, seconds between two reads of the input signals |
 | `RECONNECT_DELAY` | `3.0` | pause before retrying a failed connection, shared |
 | `AUTOREFRESH_INTERVALS` | `(5, 10, 30, 60)` | GUI, seconds |
 | `FOCUS_REFRESH_MIN_GAP` | `1.5` | GUI, throttles refresh-on-focus |

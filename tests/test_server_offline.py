@@ -594,6 +594,13 @@ check("the proxy switch is off unless asked for", parse([]).trust_proxy, False)
 check("and the environment can ask for it",
       parse([], KRAMER_TRUST_PROXY="1").trust_proxy, True)
 check("and the heartbeat", parse([], KRAMER_HEARTBEAT="5").heartbeat, 5.0)
+check("the signal reading defaults to a minute",
+      parse([]).signal_interval, 60.0)
+check("its interval comes from the environment",
+      parse([], KRAMER_SIGNAL_INTERVAL="0").signal_interval, 0.0)
+check("and a flag beats it",
+      parse(["--signal-interval", "15"],
+            KRAMER_SIGNAL_INTERVAL="0").signal_interval, 15.0)
 check("preset changes can be enabled by the environment",
       parse([], KRAMER_ALLOW_PRESET_CHANGES="1").allow_preset_changes, True)
 check("but not enabled by a blank one",
@@ -946,6 +953,137 @@ try:
     nl._maybe_resync()
     check("a read that fails claims no preset", nl.active_preset, None)
     check("and reports the link as down", nl.connected, False)
+finally:
+    ks.log = quiet_log
+
+
+# --- which inputs carry a signal ------------------------------------------- #
+# Instruction 15 with OUTPUT 1. Measured on a VS-44HN, firmware 3.3, with a PC
+# switched on behind inputs 3 and 4 and one in standby behind 1 and 2: 0F 83 81 81
+# answers 4F 83 81 81, 0F 81 81 81 answers 4F 81 80 81, and asking for input 9
+# is refused with 50 80 82 81.
+
+class ReplyTransport:
+    """Hands back one canned reply per command and keeps what was sent."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.sent = []
+
+    def send(self, data):
+        self.sent.append(data)
+
+    def recv(self, timeout=1.0, maxlen=512, expect=None):
+        return self.replies.pop(0) if self.replies else b""
+
+
+def asked(reply, inp=3):
+    t = ReplyTransport(reply)
+    p = ks.kv.Protocol2000(t)
+    p.on_notify = lambda frames: None
+    return p.signal(inp), t.sent
+
+
+got, sent = asked(bytes.fromhex("4F838181"))
+check("the signal query is instruction 15, OUTPUT 1", sent,
+      [bytes.fromhex("0F838181")])
+check("a reply with OUTPUT 1 means a signal", got, True)
+check("a reply with OUTPUT 0 means none",
+      asked(bytes.fromhex("4F818081"), 1)[0], False)
+check("a refusal is not known, not False",
+      asked(bytes.fromhex("50808281"), 9)[0], None)
+check("and neither is silence", asked(b"")[0], None)
+
+
+class SignalProto:
+    name = "Protocol 2000"
+
+    def __init__(self, answers):
+        self.answers = answers          # {input: True|False|None|exception}
+        self.asked = []
+
+    def signal(self, inp):
+        self.asked.append(inp)
+        value = self.answers[inp]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
+def signal_link(answers, interval=60.0):
+    sl = ks.DeviceLink("203.0.113.1", 5000, signal_interval=interval)
+    sl._proto = SignalProto(answers)
+    sl._transport = BeatTransport(0)
+    sl.connected = True
+    sl.changes = 0
+
+    def changed():
+        sl.changes += 1
+    sl.on_change = changed
+    return sl
+
+
+quiet_log = ks.log
+said = []
+ks.log = said.append
+try:
+    sl = signal_link({1: False, 2: False, 3: True, 4: True})
+    check("before any reading every input is unknown",
+          sl.snapshot()["signals"], {"1": None, "2": None, "3": None, "4": None})
+    sl._maybe_read_signal()
+    check("one idle pass asks one input", sl._proto.asked, [1])
+    for _ in range(3):
+        sl._maybe_read_signal()
+    check("and a round covers all four, in order", sl._proto.asked, [1, 2, 3, 4])
+    check("which the state then reports",
+          sl.snapshot()["signals"], {"1": False, "2": False, "3": True, "4": True})
+    check("each new reading is published", sl.changes, 4)
+    check("and a first reading is not logged as a change", said, [])
+
+    sl._maybe_read_signal()
+    check("the next round waits for the interval", sl._proto.asked, [1, 2, 3, 4])
+
+    sl._signal_next = 0.0
+    sl._proto.answers[3] = False
+    for _ in range(4):
+        sl._maybe_read_signal()
+    check("a source going away is noticed", sl.signals[3], False)
+    check("and only that reading is published again", sl.changes, 5)
+    check("and logged", said, ["input 3: signal gone"])
+
+    sl._signal_next = 0.0
+    sl._proto.answers[4] = None
+    for _ in range(4):
+        sl._maybe_read_signal()
+    check("a refused or unanswered read becomes unknown",
+          sl.snapshot()["signals"]["4"], None)
+
+    # The rule the routing follows too: what a matrix nobody can reach said a
+    # minute ago is not something to go on reporting.
+    sl = signal_link({1: True, 2: True, 3: True, 4: True})
+    for _ in range(4):
+        sl._maybe_read_signal()
+    sl._drop("test")
+    check("a lost link reports every input as unknown",
+          sl.snapshot()["signals"], {"1": None, "2": None, "3": None, "4": None})
+    check("and forgets the readings", sl.signals, {})
+    check("so the next connection reads again at once", sl._signal_next, 0.0)
+
+    sl = signal_link({1: OSError("connection reset")})
+    sl._maybe_read_signal()
+    check("a socket error during the read drops the link", sl.connected, False)
+
+    sl = signal_link({1: True, 2: True, 3: True, 4: True}, interval=0)
+    for _ in range(4):
+        sl._maybe_read_signal()
+    check("interval 0 never asks", sl._proto.asked, [])
+    check("and reports every input as unknown",
+          sl.snapshot()["signals"], {"1": None, "2": None, "3": None, "4": None})
+
+    sl = signal_link({})
+    sl._proto = None
+    sl._maybe_read_signal()
+    check("no read is attempted without a link", sl.changes, 0)
 finally:
     ks.log = quiet_log
 
